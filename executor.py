@@ -1,20 +1,33 @@
 """Execute a trusted local build plan using bounded parallel subprocesses."""
 from collections import deque
+from collections.abc import Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
 import json
 import math
 import os
+import selectors
 import shutil
+import signal
 import stat as stat_mod
 import subprocess
 import tempfile
+import time
 from typing import Optional
 
 
 CAP_LIMIT = 1 << 40
 MAX_STEPS = 18
+MAX_GUARDED_STEPS = 256
+MAX_GUARDED_WORKERS = 8
+MAX_TAIL_BYTES = 16384
+MAX_CHECKS_PER_STEP = 64
+CHECK_PREFIX = b"@@BUILD-CHECK "
+CHECK_ID_MAX = 32
+# Prefix + id + one separator + four-byte PASS/FAIL (LF excluded).
+CHECK_LINE_BODY_MAX = len(CHECK_PREFIX) + CHECK_ID_MAX + 1 + 4
+READ_CHUNK = 64 * 1024
 SCRATCH_PREFIX = "build-scratch-"
 TERMINAL_STATES = frozenset(
     ("ok", "failed", "timeout", "launch_error", "artifact_error", "skipped"))
@@ -33,6 +46,14 @@ class Outcome:
     returncode: Optional[int] = None
     blocked_by: tuple = ()
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class GuardedOutcome:
+    """Outcome plus bounded raw diagnostic tails for a supervised step."""
+    outcome: Outcome
+    stdout_tail: bytes = b""
+    stderr_tail: bytes = b""
 
 
 def _launch(step, cwd):
@@ -110,6 +131,437 @@ def execute(plan, *, workers=2, cwd=None):
                     graph.done(name)
                 ready.extend(graph.get_ready())
     return {name: result[name] for name in names}
+
+
+def _valid_check_id(check_id):
+    return (
+        isinstance(check_id, str)
+        and 1 <= len(check_id) <= CHECK_ID_MAX
+        and all(
+            "a" <= ch <= "z"
+            or "A" <= ch <= "Z"
+            or "0" <= ch <= "9"
+            or ch in "_-"
+            for ch in check_id
+        )
+    )
+
+
+def _validate_guarded_plan(plan, checks, tail_bytes, workers):
+    if type(workers) is not int or not 1 <= workers <= MAX_GUARDED_WORKERS:
+        raise ValueError(
+            f"workers must be an integer in [1, {MAX_GUARDED_WORKERS}]")
+    if type(tail_bytes) is not int or not 0 <= tail_bytes <= MAX_TAIL_BYTES:
+        raise ValueError(
+            f"tail_bytes must be an integer in [0, {MAX_TAIL_BYTES}]")
+
+    try:
+        materialized_plan = dict(plan)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("plan must be a name to Step mapping") from exc
+    if len(materialized_plan) > MAX_GUARDED_STEPS:
+        raise ValueError(f"at most {MAX_GUARDED_STEPS} steps per guarded call")
+
+    names, validated_plan = _validate_plan(materialized_plan, workers)
+
+    required = {}
+    if checks is not None:
+        if not isinstance(checks, Mapping):
+            raise ValueError("checks must be None or a mapping")
+        for name, ids in checks.items():
+            if name not in validated_plan:
+                raise ValueError(f"checks: unknown step {name!r}")
+            if not isinstance(ids, tuple):
+                raise ValueError(f"checks[{name!r}] must be a tuple of IDs")
+            if len(ids) > MAX_CHECKS_PER_STEP:
+                raise ValueError(
+                    f"checks[{name!r}]: at most {MAX_CHECKS_PER_STEP} IDs")
+            seen = set()
+            for check_id in ids:
+                if not _valid_check_id(check_id):
+                    raise ValueError(
+                        f"checks[{name!r}]: invalid check ID {check_id!r}")
+                if check_id in seen:
+                    raise ValueError(
+                        f"checks[{name!r}]: duplicate check ID {check_id!r}")
+                seen.add(check_id)
+            if ids:
+                required[name] = ids
+
+    try:
+        TopologicalSorter(
+            {name: validated_plan[name].after for name in names}).prepare()
+    except CycleError as exc:
+        raise ValueError(f"dependency cycle: {exc.args[1]}") from exc
+
+    return names, validated_plan, required
+
+
+def _append_tail(tail, chunk, limit):
+    if limit <= 0:
+        return
+    tail.extend(chunk)
+    extra = len(tail) - limit
+    if extra > 0:
+        del tail[:extra]
+
+
+def _is_check_id_byte(value):
+    return (
+        48 <= value <= 57       # 0-9
+        or 65 <= value <= 90    # A-Z
+        or 97 <= value <= 122   # a-z
+        or value == 95          # _
+        or value == 45          # -
+    )
+
+
+class _CheckProtocolParser:
+    """Incremental parser which never buffers an entire ordinary log line."""
+
+    def __init__(self, required_ids):
+        self.required = tuple(required_ids)
+        self.required_set = set(required_ids)
+        self.reported = set()
+        self.passed = set()
+        self.fatal = None
+        self._reset_line()
+
+    def _reset_line(self):
+        self.ordinary = False
+        self.matched_prefix = 0
+        self.in_check_line = False
+        self.id_bytes = bytearray()
+        self.current_id = None
+        self.phase = "id"
+        self.status_bytes = bytearray()
+
+    def _protocol_error(self, reason, check_id=None):
+        if check_id is None:
+            check_id = self.current_id
+        if check_id:
+            detail = (
+                f"check protocol error for ID {check_id!r}: {reason}")
+        else:
+            detail = f"check protocol error: {reason}"
+        self.fatal = ("check_protocol_error", detail)
+        return self.fatal
+
+    def _check_failed(self, check_id):
+        detail = f"BUILD-CHECK reported FAIL for required ID {check_id!r}"
+        self.fatal = ("check_failed", detail)
+        return self.fatal
+
+    def feed(self, data):
+        if self.fatal is not None:
+            return self.fatal
+
+        pos = 0
+        size = len(data)
+        while pos < size:
+            if self.ordinary:
+                newline = data.find(b"\n", pos)
+                if newline < 0:
+                    return None
+                pos = newline + 1
+                self._reset_line()
+                continue
+
+            if not self.in_check_line:
+                remaining = CHECK_PREFIX[self.matched_prefix:]
+                available = min(size - pos, len(remaining))
+                offset = 0
+                while (offset < available
+                       and data[pos + offset] == remaining[offset]):
+                    offset += 1
+
+                if offset < available:
+                    # The mismatching byte may itself be LF.  Ordinary-line
+                    # scanning handles that and starts the next line correctly.
+                    self.ordinary = True
+                    pos += offset
+                    continue
+
+                self.matched_prefix += offset
+                pos += offset
+                if self.matched_prefix == len(CHECK_PREFIX):
+                    self.in_check_line = True
+                continue
+
+            while pos < size:
+                value = data[pos]
+                pos += 1
+
+                if self.phase == "id":
+                    if value == 32:  # ASCII space
+                        if not self.id_bytes:
+                            return self._protocol_error("empty check ID")
+                        check_id = self.id_bytes.decode("ascii")
+                        if check_id not in self.required_set:
+                            return self._protocol_error(
+                                "undeclared check ID", check_id)
+                        if check_id in self.reported:
+                            return self._protocol_error(
+                                "duplicate report for check ID", check_id)
+                        self.current_id = check_id
+                        self.phase = "status"
+                    elif value == 10:  # LF
+                        return self._protocol_error(
+                            "check line ended before its verdict")
+                    else:
+                        if len(self.id_bytes) >= CHECK_ID_MAX:
+                            return self._protocol_error(
+                                "check ID is longer than 32 ASCII characters")
+                        if not _is_check_id_byte(value):
+                            return self._protocol_error(
+                                f"invalid check ID byte 0x{value:02x}")
+                        self.id_bytes.append(value)
+
+                elif self.phase == "status":
+                    if value == 10:
+                        return self._protocol_error(
+                            "check line ended before a complete PASS/FAIL")
+                    self.status_bytes.append(value)
+                    status = bytes(self.status_bytes)
+                    if (not b"PASS".startswith(status)
+                            and not b"FAIL".startswith(status)):
+                        return self._protocol_error(
+                            "verdict must be exactly PASS or FAIL")
+                    if len(self.status_bytes) == 4:
+                        self.phase = "lf"
+
+                else:  # Exactly one LF must terminate the four-byte verdict.
+                    if value != 10:
+                        return self._protocol_error(
+                            "expected LF immediately after PASS/FAIL")
+                    check_id = self.current_id
+                    self.reported.add(check_id)
+                    if bytes(self.status_bytes) == b"FAIL":
+                        return self._check_failed(check_id)
+                    self.passed.add(check_id)
+                    self._reset_line()
+                    break
+
+        return None
+
+    def handle_eof(self):
+        if self.fatal is not None:
+            return self.fatal
+        if self.in_check_line:
+            return self._protocol_error(
+                "check-prefixed line has no terminating LF at EOF")
+        return None
+
+    def missing_ids(self):
+        return tuple(cid for cid in self.required if cid not in self.passed)
+
+
+def _kill_step_group(proc):
+    if proc is None:
+        return
+    try:
+        # execute_guarded starts each child as a session/group leader.
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _run_guarded_step(name, step, required_ids, tail_limit, cwd):
+    try:
+        proc = subprocess.Popen(
+            step.argv,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return GuardedOutcome(
+            Outcome("launch_error", detail=str(exc)), b"", b"")
+
+    parser = _CheckProtocolParser(required_ids) if required_ids else None
+    stdout_tail = bytearray()
+    stderr_tail = bytearray()
+    selector = None
+    verdict = None
+
+    try:
+        deadline = time.monotonic() + step.timeout
+        stdout_fd = proc.stdout.fileno()
+        stderr_fd = proc.stderr.fileno()
+        selector = selectors.DefaultSelector()
+        selector.register(stdout_fd, selectors.EVENT_READ)
+        selector.register(stderr_fd, selectors.EVENT_READ)
+        open_fds = {stdout_fd, stderr_fd}
+
+        while open_fds and verdict is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                verdict = ("timeout", None, "")
+                break
+
+            events = selector.select(remaining)
+            for key, _event_mask in events:
+                fd = key.fd
+                try:
+                    chunk = os.read(fd, READ_CHUNK)
+                except InterruptedError:
+                    continue
+                except OSError:
+                    chunk = b""
+
+                if chunk:
+                    if fd == stdout_fd:
+                        _append_tail(stdout_tail, chunk, tail_limit)
+                    else:
+                        _append_tail(stderr_tail, chunk, tail_limit)
+                        if parser is not None:
+                            fatal = parser.feed(chunk)
+                            if fatal is not None:
+                                verdict = (fatal[0], None, fatal[1])
+                                break
+                    continue
+
+                if fd not in open_fds:
+                    continue
+                open_fds.remove(fd)
+                try:
+                    selector.unregister(fd)
+                except (KeyError, ValueError, OSError):
+                    pass
+
+                if fd == stderr_fd and parser is not None:
+                    fatal = parser.handle_eof()
+                    if fatal is not None:
+                        verdict = (fatal[0], None, fatal[1])
+                        break
+
+        if verdict is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                verdict = ("timeout", None, "")
+            else:
+                try:
+                    returncode = proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    verdict = ("timeout", None, "")
+                else:
+                    if returncode != 0:
+                        verdict = ("failed", returncode, "")
+                    elif parser is None:
+                        verdict = ("ok", 0, "")
+                    else:
+                        missing = parser.missing_ids()
+                        if missing:
+                            if len(missing) == 1:
+                                detail = (
+                                    "missing required check ID: "
+                                    + ", ".join(missing))
+                            else:
+                                detail = (
+                                    "missing required check IDs: "
+                                    + ", ".join(missing))
+                            verdict = ("check_incomplete", 0, detail)
+                        else:
+                            verdict = ("ok", 0, "")
+
+        # A check rejection or deadline can race with process exit.  The
+        # verdict chosen above is authoritative; only reap/cleanup differs.
+        if proc.returncode is None:
+            _kill_step_group(proc)
+            try:
+                proc.wait()
+            except OSError:
+                pass
+
+        status, returncode, detail = verdict
+        outcome = Outcome(
+            status=status, returncode=returncode, detail=detail)
+        return GuardedOutcome(
+            outcome, bytes(stdout_tail), bytes(stderr_tail))
+
+    except BaseException:
+        if proc.returncode is None:
+            _kill_step_group(proc)
+            try:
+                proc.wait()
+            except OSError:
+                pass
+        raise
+    finally:
+        if selector is not None:
+            try:
+                selector.close()
+            except Exception:
+                pass
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+
+def execute_guarded(plan, *, checks=None, tail_bytes=4096, workers=2,
+                    cwd=None):
+    """Run a plan with stderr check protocol and bounded diagnostic tails.
+
+    All declarations and the dependency graph are validated before a command
+    starts.  Enabled steps parse ``@@BUILD-CHECK ...`` lines on stderr.  A
+    FAIL/protocol error or timeout kills the step's own process group and
+    blocks that step's downstream branch without stopping independent work.
+    """
+    names, validated_plan, required = _validate_guarded_plan(
+        plan, checks, tail_bytes, workers)
+
+    graph = TopologicalSorter(
+        {name: validated_plan[name].after for name in names})
+    graph.prepare()
+    ready = deque(graph.get_ready())
+    results = {}
+    active = {}
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        while ready or active:
+            while ready and len(active) < workers:
+                name = ready.popleft()
+                blockers = tuple(dict.fromkeys(
+                    dep for dep in validated_plan[name].after
+                    if results[dep].outcome.status != "ok"
+                ))
+                if blockers:
+                    results[name] = GuardedOutcome(
+                        Outcome("skipped", blocked_by=blockers))
+                    graph.done(name)
+                    ready.extend(graph.get_ready())
+                    continue
+
+                future = pool.submit(
+                    _run_guarded_step,
+                    name,
+                    validated_plan[name],
+                    required.get(name, ()),
+                    tail_bytes,
+                    cwd,
+                )
+                active[future] = name
+
+            if active:
+                completed, _still_active = wait(
+                    active, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    name = active.pop(future)
+                    results[name] = future.result()
+                    graph.done(name)
+                ready.extend(graph.get_ready())
+
+    return {name: results[name] for name in names}
 
 
 def _feasible(names, deps, reserve, consumers, assumed_done, held0,
