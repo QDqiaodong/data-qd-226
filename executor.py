@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
+import hashlib
 import json
 import math
 import os
@@ -13,6 +14,7 @@ import signal
 import stat as stat_mod
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Optional
 
@@ -31,6 +33,18 @@ READ_CHUNK = 64 * 1024
 SCRATCH_PREFIX = "build-scratch-"
 TERMINAL_STATES = frozenset(
     ("ok", "failed", "timeout", "launch_error", "artifact_error", "skipped"))
+
+MAX_INCREMENTAL_STEPS = 256
+MAX_TARGETS = 256
+MAX_INCREMENTAL_WORKERS = 8
+MAX_DECLARED_FILE_PATHS = 4096
+MAX_DECLARATION_ITEMS = 16384
+MAX_RELATIVE_PATH_BYTES = 256
+MAX_AFTER_ITEMS = 256
+MAX_CONTEXT_BYTES = 256
+INCREMENTAL_STATE_VERSION = 1
+INCREMENTAL_SUCCESS_STATES = frozenset(("ok", "reused"))
+SHA256_PREFIX = "sha256:"
 
 
 @dataclass(frozen=True)
@@ -54,6 +68,22 @@ class GuardedOutcome:
     outcome: Outcome
     stdout_tail: bytes = b""
     stderr_tail: bytes = b""
+
+
+@dataclass(frozen=True)
+class IncrementalResult:
+    """Selected target closure outcomes and source bytes fingerprinted here."""
+    outcomes: dict
+    source_bytes_read: int
+
+
+def _timeout_is_finite_positive(timeout):
+    if type(timeout) not in (float, int):
+        return False
+    try:
+        return math.isfinite(timeout) and timeout > 0
+    except OverflowError:
+        return False
 
 
 def _launch(step, cwd):
@@ -94,8 +124,7 @@ def _validate_plan(plan, workers):
         if not isinstance(step.after, tuple) or any(
                 not isinstance(dep, str) or dep not in plan for dep in step.after):
             raise ValueError(f"{name}: invalid dependency")
-        if (type(step.timeout) not in (float, int)
-                or not math.isfinite(step.timeout) or step.timeout <= 0):
+        if not _timeout_is_finite_positive(step.timeout):
             raise ValueError(f"{name}: timeout must be finite and positive")
     return list(plan), plan
 
@@ -911,3 +940,641 @@ def execute_with_artifacts(plan, *, outputs, uses, capacity, scratch_dir,
         shutil.rmtree(scratch)
 
     return {name: result[name] for name in names}
+
+
+def _valid_relative_workspace_path(value):
+    if not isinstance(value, str) or not value:
+        return False
+    if "\x00" in value or value.startswith("/"):
+        return False
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    if len(encoded) > MAX_RELATIVE_PATH_BYTES:
+        return False
+    # Canonical POSIX-relative form: no empty component, ".", or "..".
+    return all(part not in ("", ".", "..") for part in value.split("/"))
+
+
+def _workspace_fs_path(root, relative_path):
+    return os.path.join(root, *relative_path.split("/"))
+
+
+def _valid_sha256(value):
+    return (
+        isinstance(value, str)
+        and len(value) == len(SHA256_PREFIX) + 64
+        and value.startswith(SHA256_PREFIX)
+        and all(ch in "0123456789abcdef" for ch in value[len(SHA256_PREFIX):])
+    )
+
+
+def _regular_file_digest(relative_path, root, label):
+    """Hash one regular file in bounded memory.
+
+    Returns ``(digest, detail, bytes_read)``.  ``bytes_read`` includes a prefix
+    already consumed if a read fails midway.
+    """
+    fs_path = _workspace_fs_path(root, relative_path)
+    try:
+        info = os.lstat(fs_path)
+    except OSError as exc:
+        return None, f"{label} path {relative_path!r}: {exc}", 0
+
+    if stat_mod.S_ISLNK(info.st_mode):
+        kind = "symbolic link"
+    elif not stat_mod.S_ISREG(info.st_mode):
+        kind = "not a regular file"
+    else:
+        kind = ""
+    if kind:
+        return None, f"{label} path {relative_path!r}: {kind}", 0
+
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        fd = os.open(fs_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            while True:
+                chunk = os.read(fd, READ_CHUNK)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                total += len(chunk)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        return None, f"{label} path {relative_path!r}: {exc}", total
+
+    return SHA256_PREFIX + digest.hexdigest(), None, total
+
+
+class _SourceRead:
+    __slots__ = ("lock", "done", "digest", "detail", "bytes_read")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.done = False
+        self.digest = None
+        self.detail = None
+        self.bytes_read = 0
+
+
+class _SourceFingerprintCache:
+    """Deduplicates both successful hashes and source read failures by path."""
+
+    def __init__(self, root):
+        self.root = root
+        self._map_lock = threading.Lock()
+        self._reads = {}
+        self._counter_lock = threading.Lock()
+        self.bytes_read = 0
+
+    def get(self, relative_path):
+        with self._map_lock:
+            read = self._reads.get(relative_path)
+            if read is None:
+                read = _SourceRead()
+                self._reads[relative_path] = read
+
+        with read.lock:
+            if not read.done:
+                digest, detail, count = _regular_file_digest(
+                    relative_path, self.root, "source")
+                read.digest = digest
+                read.detail = detail
+                read.bytes_read = count
+                read.done = True
+                with self._counter_lock:
+                    self.bytes_read += count
+            return read.digest, read.detail, read.bytes_read
+
+
+def _path_argument(value, argument_name):
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, os.PathLike):
+        raw = os.fspath(value)
+        if not isinstance(raw, str):
+            raise ValueError(f"{argument_name} must be a string path")
+        text = raw
+    else:
+        raise ValueError(f"{argument_name} must be a path")
+    if "\x00" in text:
+        raise ValueError(f"{argument_name} must not contain NUL")
+    return text
+
+
+def _validate_incremental_call(
+        plan, targets, sources, outputs, reads, context, state_file,
+        workers, cwd):
+    if type(workers) is not int or not 1 <= workers <= MAX_INCREMENTAL_WORKERS:
+        raise ValueError(
+            f"workers must be an integer in [1, {MAX_INCREMENTAL_WORKERS}]")
+
+    if not isinstance(context, str) or not context:
+        raise ValueError("context must be a nonempty string")
+    try:
+        context_size = len(context.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValueError("context must be valid UTF-8") from exc
+    if context_size > MAX_CONTEXT_BYTES:
+        raise ValueError(
+            f"context must be at most {MAX_CONTEXT_BYTES} UTF-8 bytes")
+
+    if not isinstance(plan, Mapping):
+        raise ValueError("plan must be a name to Step mapping")
+    try:
+        materialized_plan = dict(plan)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("plan must be a name to Step mapping") from exc
+    if len(materialized_plan) > MAX_INCREMENTAL_STEPS:
+        raise ValueError(f"at most {MAX_INCREMENTAL_STEPS} steps per call")
+
+    names, validated_plan = _validate_plan(materialized_plan, workers)
+    for name in names:
+        if len(validated_plan[name].after) > MAX_AFTER_ITEMS:
+            raise ValueError(
+                f"{name}: at most {MAX_AFTER_ITEMS} raw after entries")
+
+    if not isinstance(targets, tuple) or not targets:
+        raise ValueError("targets must be a nonempty tuple of step names")
+    if len(targets) > MAX_TARGETS:
+        raise ValueError(f"at most {MAX_TARGETS} targets")
+    if any(not isinstance(target, str) or not target for target in targets):
+        raise ValueError("targets must contain nonempty step-name strings")
+    if len(set(targets)) != len(targets):
+        raise ValueError("targets must not contain duplicates")
+    for target in targets:
+        if target not in validated_plan:
+            raise ValueError(f"unknown target step {target!r}")
+
+    for value, label in ((sources, "sources"), (outputs, "outputs"),
+                         (reads, "reads")):
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{label} must be a mapping")
+
+    source_paths = {name: () for name in names}
+    output_paths = {name: () for name in names}
+    read_refs = {name: () for name in names}
+    declaration_items = 0
+
+    for step_name, paths in sources.items():
+        if step_name not in validated_plan:
+            raise ValueError(f"sources: unknown step {step_name!r}")
+        if not isinstance(paths, tuple):
+            raise ValueError(f"sources[{step_name!r}] must be a tuple")
+        for path in paths:
+            if not _valid_relative_workspace_path(path):
+                raise ValueError(
+                    f"sources[{step_name!r}]: invalid workspace path {path!r}")
+        source_paths[step_name] = paths
+        declaration_items += len(paths)
+
+    output_owner = {}
+    distinct_paths = set()
+    for step_name, paths in outputs.items():
+        if step_name not in validated_plan:
+            raise ValueError(f"outputs: unknown step {step_name!r}")
+        if not isinstance(paths, tuple):
+            raise ValueError(f"outputs[{step_name!r}] must be a tuple")
+        for path in paths:
+            if not _valid_relative_workspace_path(path):
+                raise ValueError(
+                    f"outputs[{step_name!r}]: invalid workspace path {path!r}")
+            previous_owner = output_owner.get(path)
+            if previous_owner is not None and previous_owner != step_name:
+                raise ValueError(
+                    f"output path {path!r} is declared by both "
+                    f"{previous_owner!r} and {step_name!r}")
+            output_owner[path] = step_name
+            distinct_paths.add(path)
+        output_paths[step_name] = paths
+        declaration_items += len(paths)
+
+    for paths in source_paths.values():
+        for path in paths:
+            if path in output_owner:
+                raise ValueError(
+                    f"path {path!r} cannot be both source and output")
+            distinct_paths.add(path)
+
+    if len(distinct_paths) > MAX_DECLARED_FILE_PATHS:
+        raise ValueError(
+            f"at most {MAX_DECLARED_FILE_PATHS} distinct declared file paths")
+
+    # A declared path cannot be a directory ancestor of another.  Path component
+    # depth is bounded by the 256 UTF-8 byte path limit.
+    for path in distinct_paths:
+        components = path.split("/")
+        prefix_components = []
+        for component in components[:-1]:
+            prefix_components.append(component)
+            if "/".join(prefix_components) in distinct_paths:
+                raise ValueError(
+                    f"declared path {'/'.join(prefix_components)!r} is an "
+                    f"ancestor of {path!r}")
+
+    output_sets = {name: set(output_paths[name]) for name in names}
+    for consumer, items in reads.items():
+        if consumer not in validated_plan:
+            raise ValueError(f"reads: unknown consumer {consumer!r}")
+        if not isinstance(items, tuple):
+            raise ValueError(f"reads[{consumer!r}] must be a tuple")
+        seen = set()
+        normalized = []
+        for item in items:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise ValueError(
+                    f"reads[{consumer!r}] entries must be "
+                    "(producer_name, output_path) tuples")
+            producer, path = item
+            if not isinstance(producer, str) or producer not in validated_plan:
+                raise ValueError(
+                    f"reads[{consumer!r}]: unknown producer {producer!r}")
+            if not _valid_relative_workspace_path(path):
+                raise ValueError(
+                    f"reads[{consumer!r}]: invalid output path {path!r}")
+            if path not in output_sets[producer]:
+                raise ValueError(
+                    f"read {producer!r}/{path!r} does not point to a declared "
+                    "output")
+            identity = (producer, path)
+            if identity in seen:
+                raise ValueError(
+                    f"reads[{consumer!r}]: duplicate read {identity!r}")
+            seen.add(identity)
+            normalized.append(identity)
+        read_refs[consumer] = tuple(normalized)
+        declaration_items += len(items)
+
+    if declaration_items > MAX_DECLARATION_ITEMS:
+        raise ValueError(
+            f"at most {MAX_DECLARATION_ITEMS} path/read declaration items")
+
+    combined_dependencies = {}
+    for name in names:
+        combined_dependencies[name] = tuple(dict.fromkeys(
+            tuple(validated_plan[name].after)
+            + tuple(producer for producer, _path in read_refs[name])
+        ))
+    try:
+        TopologicalSorter(combined_dependencies).prepare()
+    except CycleError as exc:
+        raise ValueError(f"dependency cycle: {exc.args[1]}") from exc
+
+    state_text = _path_argument(state_file, "state_file")
+    cwd_text = None if cwd is None else _path_argument(cwd, "cwd")
+    workspace = os.getcwd() if cwd_text is None else os.path.abspath(cwd_text)
+    state_path = os.path.abspath(state_text)
+
+    return (
+        names, validated_plan, targets, source_paths, output_paths,
+        read_refs, combined_dependencies, context, workspace, state_path,
+    )
+
+
+def _validate_loaded_state(records):
+    if not isinstance(records, dict):
+        raise ValueError("corrupt incremental state: records must be an object")
+
+    for name, record in records.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("corrupt incremental state: invalid record name")
+        if not isinstance(record, dict):
+            raise ValueError(f"corrupt incremental state for {name!r}")
+        if set(record) != {"key", "outputs"}:
+            raise ValueError(f"corrupt incremental state for {name!r}")
+
+        key = record["key"]
+        outputs = record["outputs"]
+        if not isinstance(key, dict) or not isinstance(outputs, dict):
+            raise ValueError(f"corrupt incremental state for {name!r}")
+        if set(key) != {
+                "step", "argv", "timeout", "context", "outputs",
+                "sources", "reads"}:
+            raise ValueError(f"corrupt incremental state for {name!r}")
+        if key.get("step") != name:
+            raise ValueError(f"corrupt incremental state for {name!r}")
+
+        output_paths = key.get("outputs")
+        if not isinstance(output_paths, list) or not all(
+                _valid_relative_workspace_path(path) for path in output_paths):
+            raise ValueError(f"corrupt incremental state for {name!r}")
+        if len(set(output_paths)) != len(output_paths):
+            raise ValueError(f"corrupt incremental state for {name!r}")
+        if set(outputs) != set(output_paths):
+            raise ValueError(f"corrupt incremental state for {name!r}")
+        for path, digest in outputs.items():
+            if not _valid_relative_workspace_path(path) or not _valid_sha256(digest):
+                raise ValueError(f"corrupt incremental state for {name!r}")
+
+        sources = key.get("sources")
+        if not isinstance(sources, dict):
+            raise ValueError(f"corrupt incremental state for {name!r}")
+        for path, digest in sources.items():
+            if not _valid_relative_workspace_path(path) or not _valid_sha256(digest):
+                raise ValueError(f"corrupt incremental state for {name!r}")
+
+        reads = key.get("reads")
+        if not isinstance(reads, list):
+            raise ValueError(f"corrupt incremental state for {name!r}")
+        for read in reads:
+            if not isinstance(read, dict) or set(read) != {
+                    "producer", "output", "fingerprint"}:
+                raise ValueError(f"corrupt incremental state for {name!r}")
+            if (not isinstance(read["producer"], str)
+                    or not _valid_relative_workspace_path(read["output"])
+                    or not _valid_sha256(read["fingerprint"])):
+                raise ValueError(f"corrupt incremental state for {name!r}")
+
+        if not isinstance(key.get("argv"), list):
+            raise ValueError(f"corrupt incremental state for {name!r}")
+        timeout = key.get("timeout")
+        if type(timeout) not in (int, float) or type(timeout) is bool:
+            raise ValueError(f"corrupt incremental state for {name!r}")
+        if not isinstance(key.get("context"), str):
+            raise ValueError(f"corrupt incremental state for {name!r}")
+
+
+def _load_incremental_state(state_path, workspace):
+    if not os.path.exists(state_path):
+        return {}
+
+    try:
+        with open(state_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise ValueError("corrupt incremental state file") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("corrupt incremental state file")
+    version = data.get("version")
+    if type(version) is not int or version != INCREMENTAL_STATE_VERSION:
+        raise ValueError(
+            f"unsupported incremental state version: {version!r}")
+    if data.get("workspace") != workspace:
+        raise ValueError(
+            "incremental state file belongs to a different workspace")
+    records = data.get("records")
+    _validate_loaded_state(records)
+    return records
+
+
+def _write_incremental_state(state_path, workspace, records):
+    payload = {
+        "version": INCREMENTAL_STATE_VERSION,
+        "workspace": workspace,
+        "records": records,
+    }
+    parent = os.path.dirname(state_path)
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=".incremental-state-", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, state_path)
+    except BaseException:
+        try:
+            os.unlink(temporary_path)
+        except OSError:
+            pass
+        raise
+
+
+def _prepare_declared_outputs(root, relative_paths):
+    for relative_path in relative_paths:
+        parent_relative = relative_path.rsplit("/", 1)[0] if "/" in relative_path else ""
+        if parent_relative:
+            parent_fs = _workspace_fs_path(root, parent_relative)
+            try:
+                os.makedirs(parent_fs, exist_ok=True)
+            except OSError as exc:
+                return (
+                    f"output path {relative_path!r}: cannot prepare parent "
+                    f"directory: {exc}")
+
+        fs_path = _workspace_fs_path(root, relative_path)
+        try:
+            info = os.lstat(fs_path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            return f"output path {relative_path!r}: {exc}"
+
+        if not stat_mod.S_ISREG(info.st_mode):
+            return (
+                f"output path {relative_path!r}: existing path is not a "
+                "regular file")
+        try:
+            os.remove(fs_path)
+        except OSError as exc:
+            return f"output path {relative_path!r}: cannot remove old file: {exc}"
+    return ""
+
+
+def _run_incremental_step(
+        name, step, *, root, launch_cwd, source_paths, output_paths, context,
+        read_fingerprints, old_record, source_cache):
+    source_digests = {}
+    for relative_path in dict.fromkeys(source_paths):
+        digest, detail, _count = source_cache.get(relative_path)
+        if detail is not None:
+            return Outcome("input_error", detail=detail), {}, None
+        source_digests[relative_path] = digest
+
+    declared_outputs = tuple(dict.fromkeys(output_paths))
+    key = {
+        "step": name,
+        "argv": list(step.argv),
+        "timeout": step.timeout,
+        "context": context,
+        "outputs": sorted(declared_outputs),
+        "sources": {
+            path: source_digests[path]
+            for path in sorted(source_digests)
+        },
+        "reads": sorted(
+            read_fingerprints,
+            key=lambda item: (item["producer"], item["output"])),
+    }
+
+    current_digests = {}
+    if declared_outputs and old_record is not None and old_record.get("key") == key:
+        expected_outputs = old_record.get("outputs", {})
+        reusable = True
+        for relative_path in declared_outputs:
+            digest, detail, _count = _regular_file_digest(
+                relative_path, root, "output")
+            if (detail is not None
+                    or digest != expected_outputs.get(relative_path)):
+                reusable = False
+                break
+            current_digests[relative_path] = digest
+        if reusable:
+            record = {
+                "key": key,
+                "outputs": dict(sorted(current_digests.items())),
+            }
+            return Outcome("reused"), current_digests, record
+
+    preparation_error = _prepare_declared_outputs(root, declared_outputs)
+    if preparation_error:
+        return Outcome("output_error", detail=preparation_error), {}, None
+
+    command_outcome = _launch(step, launch_cwd)
+    if command_outcome.status != "ok":
+        return command_outcome, {}, None
+
+    if not declared_outputs:
+        return command_outcome, {}, None
+
+    current_digests = {}
+    for relative_path in declared_outputs:
+        digest, detail, _count = _regular_file_digest(
+            relative_path, root, "declared output")
+        if detail is not None:
+            return Outcome(
+                "output_error", returncode=0, detail=detail), {}, None
+        current_digests[relative_path] = digest
+
+    record = {
+        "key": key,
+        "outputs": dict(sorted(current_digests.items())),
+    }
+    return Outcome("ok", returncode=0), current_digests, record
+
+
+def execute_incremental(
+        plan, *, targets, sources, outputs, reads, context, state_file,
+        workers=2, cwd=None) -> IncrementalResult:
+    """Execute only a target closure with content-based reuse.
+
+    Current-round dependency outcomes gate execution independently from the
+    persistent content/addressed reuse key.  State is loaded and validated
+    before any subprocess starts and is atomically committed once on return.
+    """
+    (names, validated_plan, target_tuple, source_paths, output_paths,
+     read_refs, dependencies, context, workspace, state_path) = (
+        _validate_incremental_call(
+            plan, targets, sources, outputs, reads, context, state_file,
+            workers, cwd))
+
+    # State corruption/workspace mismatch is also reported before side effects.
+    old_records = _load_incremental_state(state_path, workspace)
+
+    closure = set()
+    stack = list(target_tuple)
+    while stack:
+        name = stack.pop()
+        if name in closure:
+            continue
+        closure.add(name)
+        stack.extend(dependencies[name])
+    selected_names = [name for name in names if name in closure]
+
+    source_cache = _SourceFingerprintCache(workspace)
+    outcomes = {}
+    output_digests = {}
+    records_to_write = {}
+    active = {}
+    running = set()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        while len(outcomes) < len(selected_names) or active:
+            scheduler_progress = False
+            if len(active) < workers:
+                for name in selected_names:
+                    if name in outcomes or name in running:
+                        continue
+
+                    direct_dependencies = dependencies[name]
+                    if not all(dep in outcomes for dep in direct_dependencies):
+                        continue
+
+                    blockers = tuple(dict.fromkeys(
+                        dep for dep in direct_dependencies
+                        if outcomes[dep].status not in INCREMENTAL_SUCCESS_STATES
+                    ))
+                    if blockers:
+                        outcomes[name] = Outcome(
+                            "skipped", blocked_by=blockers)
+                        scheduler_progress = True
+                        continue
+
+                    read_fingerprints = []
+                    for producer, output_path in read_refs[name]:
+                        read_fingerprints.append({
+                            "producer": producer,
+                            "output": output_path,
+                            "fingerprint": output_digests[producer][output_path],
+                        })
+
+                    running.add(name)
+                    future = pool.submit(
+                        _run_incremental_step,
+                        name,
+                        validated_plan[name],
+                        root=workspace,
+                        launch_cwd=cwd,
+                        source_paths=source_paths[name],
+                        output_paths=output_paths[name],
+                        context=context,
+                        read_fingerprints=read_fingerprints,
+                        old_record=old_records.get(name),
+                        source_cache=source_cache,
+                    )
+                    active[future] = name
+                    scheduler_progress = True
+                    if len(active) >= workers:
+                        break
+
+            if active:
+                completed, _not_completed = wait(
+                    set(active), return_when=FIRST_COMPLETED)
+                for future in completed:
+                    name = active.pop(future)
+                    running.discard(name)
+                    outcome, digests, record = future.result()
+                    outcomes[name] = outcome
+                    if outcome.status in INCREMENTAL_SUCCESS_STATES:
+                        output_digests[name] = digests
+                        if record is not None:
+                            records_to_write[name] = record
+            else:
+                unfinished = [
+                    name for name in selected_names if name not in outcomes]
+                if unfinished and not scheduler_progress:
+                    # Validation proves the combined graph is acyclic.  This is
+                    # a defensive scheduler stall rather than a user graph error.
+                    raise RuntimeError(
+                        "incremental scheduler stalled; unfinished steps: "
+                        + ", ".join(unfinished))
+
+    persisted_records = {}
+    for name in names:
+        if name in records_to_write:
+            persisted_records[name] = records_to_write[name]
+        elif name not in closure:
+            old_record = old_records.get(name)
+            if old_record is not None:
+                persisted_records[name] = old_record
+        elif outcomes[name].status == "skipped":
+            old_record = old_records.get(name)
+            if old_record is not None:
+                persisted_records[name] = old_record
+        # Selected ok steps without outputs have no reusable record; all other
+        # terminal statuses are actual failures and lose their old record.
+
+    _write_incremental_state(
+        state_path, workspace, persisted_records)
+
+    ordered_outcomes = {
+        name: outcomes[name] for name in names if name in closure}
+    return IncrementalResult(
+        outcomes=ordered_outcomes,
+        source_bytes_read=source_cache.bytes_read)
