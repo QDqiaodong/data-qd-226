@@ -8,6 +8,10 @@ import hashlib
 import json
 import math
 import os
+try:
+    import fcntl
+except ImportError:  # The cross-process incremental guarantees target Linux.
+    fcntl = None
 import selectors
 import shutil
 import signal
@@ -52,6 +56,8 @@ MAX_SCAN_MANIFEST_ITEMS = 256
 DISCOVERY_DEPS_ENV = "BUILD_DEPS_FILE"
 INCREMENTAL_STATE_VERSION = 1
 INCREMENTAL_SUCCESS_STATES = frozenset(("ok", "reused"))
+INCREMENTAL_LOCK_POLL_SECONDS = 0.02
+INCREMENTAL_STATE_LOCK_TIMEOUT = 120.0
 SHA256_PREFIX = "sha256:"
 
 
@@ -1802,6 +1808,180 @@ def _write_incremental_state(state_path, workspace, records):
         raise
 
 
+def _incremental_lock_directory(state_path):
+    # A stable sidecar directory keeps all ownership files next to the state.
+    # Lock files may safely remain after a run; flock semantics make them
+    # non-owners when no process has them locked.
+    return state_path + ".locks"
+
+
+def _ensure_incremental_lock_directory(state_path):
+    lock_directory = _incremental_lock_directory(state_path)
+    os.makedirs(lock_directory, mode=0o700, exist_ok=True)
+    return lock_directory
+
+
+def _incremental_state_lock_path(state_path):
+    return os.path.join(
+        _incremental_lock_directory(state_path), "state.lock")
+
+
+def _incremental_step_lock_path(state_path, step_name):
+    name_digest = hashlib.sha256(os.fsencode(step_name)).hexdigest()
+    return os.path.join(
+        _incremental_lock_directory(state_path), f"step-{name_digest}.lock")
+
+
+class _IncrementalFileLock:
+    """Exclusive cross-process lock with a bounded non-blocking poll.
+
+    The lock descriptor can be inherited by the trusted build command via
+    ``pass_fds``.  Consequently, if the Python caller is killed while the
+    build process is still alive, the kernel retains the flock until that
+    inherited descriptor is closed.  A waiter that acquires the lock can then
+    be certain no process from the prior ownership generation still holds it
+    open for writing.
+    """
+
+    def __init__(self, path, *, timeout, description):
+        self.path = path
+        self.timeout = timeout
+        self.description = description
+        self.fd = None
+
+    def __enter__(self):
+        if fcntl is None:
+            # The new cross-process guarantee is Linux-specific.  Preserve the
+            # old in-process behavior on platforms without fcntl rather than
+            # making the incremental entry unusable there.
+            return None
+        parent = os.path.dirname(self.path)
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        self.fd = os.open(
+            self.path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        deadline = time.monotonic() + self.timeout
+        try:
+            while True:
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return self.fd
+                except BlockingIOError as exc:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"timed out after {self.timeout:.1f}s waiting for "
+                            f"{self.description} lock {self.path!r}; the previous "
+                            "owner or a build command that inherited the lock may "
+                            "still be active"
+                        ) from exc
+                    time.sleep(min(
+                        INCREMENTAL_LOCK_POLL_SECONDS, max(0.0, remaining)))
+        except BaseException:
+            self._close_fd()
+            raise
+
+    def _close_fd(self):
+        if self.fd is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+    def __exit__(self, exc_type, exc, traceback):
+        self._close_fd()
+        return False
+
+
+def _locked_incremental_state_update(state_path, workspace, mutate):
+    """Reload, mutate, and atomically write state while holding its lock."""
+    lock_path = _incremental_state_lock_path(state_path)
+    with _IncrementalFileLock(
+            lock_path,
+            timeout=INCREMENTAL_STATE_LOCK_TIMEOUT,
+            description="incremental state commit"):
+        records = _load_incremental_state(state_path, workspace)
+        mutate(records)
+        _write_incremental_state(state_path, workspace, records)
+        return records
+
+
+def _commit_incremental_step_record(
+        state_path, workspace, step_name, record):
+    def mutate(records):
+        if record is None:
+            records.pop(step_name, None)
+        else:
+            records[step_name] = record
+
+    _locked_incremental_state_update(state_path, workspace, mutate)
+
+
+def _run_incremental_build_command(step, launch_cwd, lock_fd):
+    """Run one incremental command while optionally leaking the lease fd.
+
+    ``pass_fds`` intentionally gives the build process a reference to the
+    step's flock open-file description.  Descendants that inherit descriptors
+    extend the lease only while they remain alive; trusted builds are required
+    not to leave undeclared background writers.
+    """
+    pass_fds = () if lock_fd is None else (lock_fd,)
+    try:
+        process = subprocess.Popen(
+            step.argv,
+            cwd=launch_cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            pass_fds=pass_fds,
+        )
+    except OSError as exc:
+        return Outcome("launch_error", detail=str(exc))
+
+    try:
+        try:
+            returncode = process.wait(timeout=step.timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait()
+            except OSError:
+                pass
+            return Outcome("timeout")
+        except OSError as exc:
+            return Outcome("launch_error", detail=str(exc))
+
+        if returncode != 0:
+            return Outcome("failed", returncode)
+        return Outcome("ok", returncode=0)
+    except BaseException:
+        # Match subprocess.run's broad cleanup: ordinary interpreter errors
+        # must not leave this direct child running.  A SIGKILL of the Python
+        # process cannot execute this block; the inherited flock then protects
+        # outputs until the orphaned trusted command exits.
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait()
+            except OSError:
+                pass
+        raise
+
+
 def _prepare_declared_outputs(root, relative_paths):
     for relative_path in relative_paths:
         parent_relative = relative_path.rsplit("/", 1)[0] if "/" in relative_path else ""
@@ -1833,17 +2013,37 @@ def _prepare_declared_outputs(root, relative_paths):
     return ""
 
 
-def _run_incremental_step(
+def _incremental_step_lock_timeout(step):
+    # Cover the holder's own bounded wait plus process/JSON replacement overhead.
+    # The common acceptance paths hand off much sooner; this is only a diagnostic
+    # upper bound rather than a sleep used to infer lock state.
+    try:
+        return max(60.0, float(step.timeout) + 30.0)
+    except (TypeError, ValueError, OverflowError):
+        return 60.0
+
+
+def _run_incremental_step_body(
         name, step, *, root, launch_cwd, source_paths, output_paths, context,
-        read_fingerprints, old_record, source_cache):
+        read_fingerprints, source_cache, state_path, lock_fd):
+    declared_outputs = tuple(dict.fromkeys(output_paths))
+
+    def failure_result(outcome):
+        if declared_outputs:
+            # Remove any stale success generation before releasing ownership.
+            # A later process can therefore never inherit this attempt's
+            # failure as though it were a committed reusable result.
+            _commit_incremental_step_record(
+                state_path, root, name, None)
+        return outcome, {}, None
+
     source_digests = {}
     for relative_path in dict.fromkeys(source_paths):
         digest, detail, _count = source_cache.get(relative_path)
         if detail is not None:
-            return Outcome("input_error", detail=detail), {}, None
+            return failure_result(Outcome("input_error", detail=detail))
         source_digests[relative_path] = digest
 
-    declared_outputs = tuple(dict.fromkeys(output_paths))
     key = {
         "step": name,
         "argv": list(step.argv),
@@ -1860,31 +2060,39 @@ def _run_incremental_step(
     }
 
     current_digests = {}
-    if declared_outputs and old_record is not None and old_record.get("key") == key:
-        expected_outputs = old_record.get("outputs", {})
-        reusable = True
-        for relative_path in declared_outputs:
-            digest, detail, _count = _regular_file_digest(
-                relative_path, root, "output")
-            if (detail is not None
-                    or digest != expected_outputs.get(relative_path)):
-                reusable = False
-                break
-            current_digests[relative_path] = digest
-        if reusable:
-            record = {
-                "key": key,
-                "outputs": dict(sorted(current_digests.items())),
-            }
-            return Outcome("reused"), current_digests, record
+    if declared_outputs:
+        # The lock acquisition happens-after the previous owner's commit and
+        # happens-before this attempt's cleanup/launch.  Reload rather than
+        # using the call-start snapshot to observe cross-process records.
+        latest_records = _load_incremental_state(state_path, root)
+        latest_record = latest_records.get(name)
+        if latest_record is not None and latest_record.get("key") == key:
+            expected_outputs = latest_record.get("outputs", {})
+            reusable = True
+            for relative_path in declared_outputs:
+                digest, detail, _count = _regular_file_digest(
+                    relative_path, root, "output")
+                if (detail is not None
+                        or digest != expected_outputs.get(relative_path)):
+                    reusable = False
+                    break
+                current_digests[relative_path] = digest
+            if reusable:
+                record = {
+                    "key": key,
+                    "outputs": dict(sorted(current_digests.items())),
+                }
+                return Outcome("reused"), current_digests, record
 
     preparation_error = _prepare_declared_outputs(root, declared_outputs)
     if preparation_error:
-        return Outcome("output_error", detail=preparation_error), {}, None
+        return failure_result(Outcome(
+            "output_error", detail=preparation_error))
 
-    command_outcome = _launch(step, launch_cwd)
+    command_outcome = _run_incremental_build_command(
+        step, launch_cwd, lock_fd)
     if command_outcome.status != "ok":
-        return command_outcome, {}, None
+        return failure_result(command_outcome)
 
     if not declared_outputs:
         return command_outcome, {}, None
@@ -1894,15 +2102,42 @@ def _run_incremental_step(
         digest, detail, _count = _regular_file_digest(
             relative_path, root, "declared output")
         if detail is not None:
-            return Outcome(
-                "output_error", returncode=0, detail=detail), {}, None
+            return failure_result(Outcome(
+                "output_error", returncode=0, detail=detail))
         current_digests[relative_path] = digest
 
     record = {
         "key": key,
         "outputs": dict(sorted(current_digests.items())),
     }
+    # Publish before releasing the per-step flock.  This makes the successful
+    # record durable independently of when the whole caller invocation returns.
+    _commit_incremental_step_record(state_path, root, name, record)
     return Outcome("ok", returncode=0), current_digests, record
+
+
+def _run_incremental_step(
+        name, step, *, root, launch_cwd, source_paths, output_paths, context,
+        read_fingerprints, source_cache, state_path):
+    declared_outputs = tuple(dict.fromkeys(output_paths))
+    if not declared_outputs:
+        return _run_incremental_step_body(
+            name, step, root=root, launch_cwd=launch_cwd,
+            source_paths=source_paths, output_paths=output_paths,
+            context=context, read_fingerprints=read_fingerprints,
+            source_cache=source_cache, state_path=state_path, lock_fd=None)
+
+    lock_path = _incremental_step_lock_path(state_path, name)
+    with _IncrementalFileLock(
+            lock_path,
+            timeout=_incremental_step_lock_timeout(step),
+            description=f"incremental output step {name!r}") as lock_fd:
+        return _run_incremental_step_body(
+            name, step, root=root, launch_cwd=launch_cwd,
+            source_paths=source_paths, output_paths=output_paths,
+            context=context, read_fingerprints=read_fingerprints,
+            source_cache=source_cache, state_path=state_path,
+            lock_fd=lock_fd)
 
 
 def execute_incremental(
@@ -1912,7 +2147,9 @@ def execute_incremental(
 
     Current-round dependency outcomes gate execution independently from the
     persistent content/addressed reuse key.  State is loaded and validated
-    before any subprocess starts and is atomically committed once on return.
+    before any subprocess starts.  Valid output records are merged and
+    committed as soon as their step succeeds, followed by a final locked
+    merge before this call returns.
     """
     (names, validated_plan, target_tuple, source_paths, output_paths,
      read_refs, dependencies, context, workspace, state_path) = (
@@ -1921,7 +2158,10 @@ def execute_incremental(
             workers, cwd))
 
     # State corruption/workspace mismatch is also reported before side effects.
-    old_records = _load_incremental_state(state_path, workspace)
+    # The returned snapshot is not used for decisions: output steps reload the
+    # newest state under their cross-process ownership lock.
+    _load_incremental_state(state_path, workspace)
+    _ensure_incremental_lock_directory(state_path)
 
     closure = set()
     stack = list(target_tuple)
@@ -1936,7 +2176,6 @@ def execute_incremental(
     source_cache = _SourceFingerprintCache(workspace)
     outcomes = {}
     output_digests = {}
-    records_to_write = {}
     active = {}
     running = set()
 
@@ -1981,8 +2220,8 @@ def execute_incremental(
                         output_paths=output_paths[name],
                         context=context,
                         read_fingerprints=read_fingerprints,
-                        old_record=old_records.get(name),
                         source_cache=source_cache,
+                        state_path=state_path,
                     )
                     active[future] = name
                     scheduler_progress = True
@@ -1995,12 +2234,12 @@ def execute_incremental(
                 for future in completed:
                     name = active.pop(future)
                     running.discard(name)
-                    outcome, digests, record = future.result()
+                    outcome, digests, _record = future.result()
                     outcomes[name] = outcome
+                    # The record itself was already committed under the step
+                    # lock; only digests are needed to build read fingerprints.
                     if outcome.status in INCREMENTAL_SUCCESS_STATES:
                         output_digests[name] = digests
-                        if record is not None:
-                            records_to_write[name] = record
             else:
                 unfinished = [
                     name for name in selected_names if name not in outcomes]
@@ -2011,23 +2250,21 @@ def execute_incremental(
                         "incremental scheduler stalled; unfinished steps: "
                         + ", ".join(unfinished))
 
-    persisted_records = {}
-    for name in names:
-        if name in records_to_write:
-            persisted_records[name] = records_to_write[name]
-        elif name not in closure:
-            old_record = old_records.get(name)
-            if old_record is not None:
-                persisted_records[name] = old_record
-        elif outcomes[name].status == "skipped":
-            old_record = old_records.get(name)
-            if old_record is not None:
-                persisted_records[name] = old_record
-        # Selected ok steps without outputs have no reusable record; all other
-        # terminal statuses are actual failures and lose their old record.
+    def merge_final_records(latest_records):
+        # Commit only the newest on-disk generation.  Every local success or
+        # failure has already published its generation under the per-step lock;
+        # do not fall back to this call's stale in-memory record, because a
+        # later cross-process attempt may have legitimately deleted it.
+        persisted_records = {}
+        for name in names:
+            if output_paths[name] and name in latest_records:
+                persisted_records[name] = latest_records[name]
 
-    _write_incremental_state(
-        state_path, workspace, persisted_records)
+        latest_records.clear()
+        latest_records.update(persisted_records)
+
+    _locked_incremental_state_update(
+        state_path, workspace, merge_final_records)
 
     ordered_outcomes = {
         name: outcomes[name] for name in names if name in closure}
