@@ -42,6 +42,14 @@ MAX_DECLARATION_ITEMS = 16384
 MAX_RELATIVE_PATH_BYTES = 256
 MAX_AFTER_ITEMS = 256
 MAX_CONTEXT_BYTES = 256
+
+MAX_DISCOVERED_STEPS = 256
+MAX_DISCOVERED_TARGETS = 256
+MAX_DISCOVERED_WORKERS = 8
+MAX_DISCOVERED_NAME_BYTES = 128
+MAX_SCAN_MANIFEST_BYTES = 64 * 1024
+MAX_SCAN_MANIFEST_ITEMS = 256
+DISCOVERY_DEPS_ENV = "BUILD_DEPS_FILE"
 INCREMENTAL_STATE_VERSION = 1
 INCREMENTAL_SUCCESS_STATES = frozenset(("ok", "reused"))
 SHA256_PREFIX = "sha256:"
@@ -160,6 +168,454 @@ def execute(plan, *, workers=2, cwd=None):
                     graph.done(name)
                 ready.extend(graph.get_ready())
     return {name: result[name] for name in names}
+
+
+def _valid_discovered_name(name):
+    if not isinstance(name, str) or not name or "\x00" in name:
+        return False
+    try:
+        return len(name.encode("utf-8")) <= MAX_DISCOVERED_NAME_BYTES
+    except UnicodeEncodeError:
+        return False
+
+
+def _validate_discovery_step_arguments(name, step):
+    if (not isinstance(step.argv, tuple) or not step.argv
+            or not all(
+                isinstance(arg, str) and "\x00" not in arg
+                for arg in step.argv)
+            or not step.argv[0]):
+        raise ValueError(f"{name}: invalid argv")
+    if not _timeout_is_finite_positive(step.timeout):
+        raise ValueError(f"{name}: timeout must be finite and positive")
+
+
+def _validate_discovered_call(plan, targets, scans, workers, cwd):
+    if (type(workers) is not int
+            or not 1 <= workers <= MAX_DISCOVERED_WORKERS):
+        raise ValueError(
+            "workers must be an integer in [1, "
+            f"{MAX_DISCOVERED_WORKERS}] and must not be a bool")
+
+    if not isinstance(plan, Mapping):
+        raise ValueError("plan must be a name to Step mapping")
+    try:
+        materialized_plan = dict(plan)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("plan must be a name to Step mapping") from exc
+
+    if len(materialized_plan) > MAX_DISCOVERED_STEPS:
+        raise ValueError(f"at most {MAX_DISCOVERED_STEPS} steps per call")
+
+    names, validated_plan = _validate_plan(materialized_plan, workers)
+    for name in names:
+        if not _valid_discovered_name(name):
+            raise ValueError(
+                f"step name {name!r} must be a nonempty NUL-free string of "
+                f"at most {MAX_DISCOVERED_NAME_BYTES} UTF-8 bytes")
+        if len(validated_plan[name].after) > MAX_AFTER_ITEMS:
+            raise ValueError(
+                f"{name}: at most {MAX_AFTER_ITEMS} raw after entries")
+
+    try:
+        TopologicalSorter(
+            {name: validated_plan[name].after for name in names}).prepare()
+    except CycleError as exc:
+        raise ValueError(f"static dependency cycle: {exc.args[1]}") from exc
+
+    if not isinstance(targets, tuple) or not targets:
+        raise ValueError("targets must be a nonempty tuple of step names")
+    if len(targets) > MAX_DISCOVERED_TARGETS:
+        raise ValueError(f"at most {MAX_DISCOVERED_TARGETS} targets")
+    seen_targets = set()
+    for target in targets:
+        if not _valid_discovered_name(target):
+            raise ValueError("targets must contain valid step-name strings")
+        if target not in validated_plan:
+            raise ValueError(f"unknown target step {target!r}")
+        if target in seen_targets:
+            raise ValueError(f"targets must not contain duplicates: {target!r}")
+        seen_targets.add(target)
+
+    scan_steps = {}
+    if scans is not None:
+        if not isinstance(scans, Mapping):
+            raise ValueError("scans must be None or a name to Step mapping")
+        try:
+            scan_items = dict(scans)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("scans must be a name to Step mapping") from exc
+
+        for scan_name, scan_step in scan_items.items():
+            if scan_name not in validated_plan:
+                raise ValueError(f"scans: unknown step {scan_name!r}")
+            if not isinstance(scan_step, Step):
+                raise ValueError(f"scans[{scan_name!r}] must be a Step")
+            _validate_discovery_step_arguments(
+                f"scan {scan_name!r}", scan_step)
+            if (not isinstance(scan_step.after, tuple)
+                    or len(scan_step.after) != 0):
+                raise ValueError(
+                    f"scans[{scan_name!r}]: scan Step.after must be empty")
+            scan_steps[scan_name] = scan_step
+
+    cwd_text = None if cwd is None else _path_argument(cwd, "cwd")
+    return names, validated_plan, targets, scan_steps, workers, cwd_text
+
+
+def _read_discovery_manifest(path, known_names):
+    """Validate a scan manifest completely before any edge is adopted."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None, (
+            f"scan manifest_missing: {DISCOVERY_DEPS_ENV} file {path} "
+            "does not exist")
+    except OSError as exc:
+        return None, f"scan manifest_stat_error: cannot stat {path}: {exc}"
+
+    mode = info.st_mode
+    if stat_mod.S_ISLNK(mode):
+        return None, (
+            f"scan manifest_symlink: {path} must not be a symbolic link")
+    if not stat_mod.S_ISREG(mode):
+        return None, (
+            f"scan manifest_not_regular: {path} must be a regular file")
+    if info.st_size > MAX_SCAN_MANIFEST_BYTES:
+        return None, (
+            "scan manifest_too_large: manifest is "
+            f"{info.st_size} bytes; limit is {MAX_SCAN_MANIFEST_BYTES}")
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        return None, f"scan manifest_unreadable: {path}: {exc}"
+
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            data = handle.read(MAX_SCAN_MANIFEST_BYTES + 1)
+    except OSError as exc:
+        return None, f"scan manifest_unreadable: cannot read {path}: {exc}"
+
+    if len(data) > MAX_SCAN_MANIFEST_BYTES:
+        return None, (
+            "scan manifest_too_large: manifest exceeds "
+            f"{MAX_SCAN_MANIFEST_BYTES} bytes")
+
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return None, f"scan manifest_not_utf8: {exc}"
+
+    try:
+        manifest = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return None, f"scan manifest_invalid_json: {exc}"
+
+    if not isinstance(manifest, list):
+        return None, "scan manifest_not_array: manifest must be a JSON array"
+    if len(manifest) > MAX_SCAN_MANIFEST_ITEMS:
+        return None, (
+            "scan manifest_too_many_items: manifest has "
+            f"{len(manifest)} entries; limit is {MAX_SCAN_MANIFEST_ITEMS}")
+
+    dependencies = []
+    seen = set()
+    for item in manifest:
+        if not isinstance(item, str) or item not in known_names:
+            return None, (
+                f"scan manifest_unknown_name: {item!r} is not a known step")
+        if item in seen:
+            return None, (
+                f"scan manifest_duplicate_name: {item!r} appears more than once")
+        seen.add(item)
+        dependencies.append(item)
+
+    return tuple(dependencies), None
+
+
+def _run_discovery_scan(step, cwd, deps_path, known_names):
+    env = os.environ.copy()
+    env[DISCOVERY_DEPS_ENV] = deps_path
+    try:
+        proc = subprocess.run(
+            step.argv,
+            cwd=cwd,
+            env=env,
+            timeout=step.timeout,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return Outcome(
+            "scan_error",
+            detail=f"scan timeout: exceeded {step.timeout!r} seconds"), None
+    except OSError as exc:
+        return Outcome(
+            "scan_error",
+            detail=f"scan launch_error: {exc}"), None
+
+    if proc.returncode != 0:
+        return Outcome(
+            "scan_error",
+            returncode=proc.returncode,
+            detail=(
+                "scan process_nonzero_exit: scan exited with returncode "
+                f"{proc.returncode}")), None
+
+    dependencies, detail = _read_discovery_manifest(deps_path, known_names)
+    if detail is not None:
+        return Outcome("scan_error", returncode=0, detail=detail), None
+    return None, dependencies
+
+
+def _launch_discovered_build(step, cwd):
+    # The discovery path is protocol state for scans only.  Copy the inherited
+    # environment so an ambient value cannot leak an executor-owned path into a
+    # build; all other environment variables remain inherited.
+    env = os.environ.copy()
+    env.pop(DISCOVERY_DEPS_ENV, None)
+    return _launch_env(step, cwd, env)
+
+
+def _cyclic_vertices(graph):
+    """Return every vertex in a directed cycle, including self cycles."""
+    indices = {}
+    low_links = {}
+    stack = []
+    on_stack = set()
+    next_index = 0
+    cyclic = set()
+
+    def visit(vertex):
+        nonlocal next_index
+        indices[vertex] = next_index
+        low_links[vertex] = next_index
+        next_index += 1
+        stack.append(vertex)
+        on_stack.add(vertex)
+
+        for neighbor in graph.get(vertex, ()):
+            if neighbor not in indices:
+                visit(neighbor)
+                low_links[vertex] = min(
+                    low_links[vertex], low_links[neighbor])
+            elif neighbor in on_stack:
+                low_links[vertex] = min(
+                    low_links[vertex], indices[neighbor])
+
+        if low_links[vertex] != indices[vertex]:
+            return
+
+        component = []
+        while True:
+            current = stack.pop()
+            on_stack.remove(current)
+            component.append(current)
+            if current == vertex:
+                break
+
+        if len(component) > 1:
+            cyclic.update(component)
+        elif component[0] in graph.get(component[0], ()):
+            cyclic.add(component[0])
+
+    for vertex in graph:
+        if vertex not in indices:
+            visit(vertex)
+    return cyclic
+
+
+def execute_discovered(plan, *, targets, scans=None, workers=2, cwd=None):
+    """Execute target closures with scan-discovered dependency edges.
+
+    Each selected step's static ``after`` edges are always used.  A step named
+    in ``scans`` is probed exactly once as soon as it is selected; its JSON
+    manifest is adopted only when the complete manifest is valid.  Scans and
+    builds share the ``workers`` concurrency limit, while dependency waits do
+    not occupy a slot.  Runtime manifest cycles are reported as ``cycle`` and
+    never launch their builds; independent branches continue to run.
+    """
+    names, validated_plan, target_tuple, scan_steps, workers, cwd_text = (
+        _validate_discovered_call(plan, targets, scans, workers, cwd))
+
+    scan_root = os.path.abspath(
+        tempfile.mkdtemp(prefix="executor-discovered-"))
+    try:
+        selected = set()
+
+        def select_static_closure(initial_names):
+            stack = list(initial_names)
+            while stack:
+                name = stack.pop()
+                if name in selected:
+                    continue
+                selected.add(name)
+                stack.extend(validated_plan[name].after)
+
+        select_static_closure(target_tuple)
+
+        # Valid scan manifests, keyed by the scanned step.  A missing key means
+        # that step's manifest is not yet final; a scan failure is in outcomes.
+        manifests = {}
+        outcomes = {}
+        scans_started = set()
+        builds_started = set()
+        active = {}
+
+        def direct_dependencies(name):
+            return tuple(dict.fromkeys(
+                tuple(validated_plan[name].after)
+                + manifests.get(name, ())))
+
+        def discovery_settled():
+            for name in selected:
+                if (name in scan_steps and name not in outcomes
+                        and name not in manifests):
+                    return False
+            return True
+
+        def classify_final_cycles_and_skips():
+            if not discovery_settled():
+                return
+
+            scan_failures = {
+                name for name, outcome in outcomes.items()
+                if outcome.status == "scan_error"
+            }
+            graph = {}
+            for name in names:
+                if name not in selected or name in scan_failures:
+                    continue
+                graph[name] = tuple(
+                    dep for dep in direct_dependencies(name)
+                    if dep not in scan_failures)
+
+            for name in _cyclic_vertices(graph):
+                # No cyclic build can have been admitted because admission
+                # requires every direct dependency to already be terminal ok.
+                if name not in outcomes:
+                    outcomes[name] = Outcome("cycle")
+
+            # Cascade skips after cycle classification.  Outcomes are terminal,
+            # so this reaches a fixed point in at most len(names) passes.
+            changed = True
+            while changed:
+                changed = False
+                for name in names:
+                    if (name not in selected or name in outcomes
+                            or name in builds_started):
+                        continue
+                    if name in scan_steps and name not in manifests:
+                        continue
+                    deps = direct_dependencies(name)
+                    if not all(dep in outcomes for dep in deps):
+                        continue
+                    blockers = tuple(dict.fromkeys(
+                        dep for dep in deps
+                        if outcomes[dep].status != "ok"))
+                    if blockers:
+                        outcomes[name] = Outcome(
+                            "skipped", blocked_by=blockers)
+                        changed = True
+
+        def launch_available(pool):
+            free_slots = workers - len(active)
+            if free_slots <= 0:
+                return
+
+            for name in names:
+                if free_slots <= 0:
+                    break
+                if name not in selected or name in outcomes:
+                    continue
+
+                scan_step = scan_steps.get(name)
+                if scan_step is not None and name not in scans_started:
+                    scan_dir = tempfile.mkdtemp(
+                        prefix="scan-", dir=scan_root)
+                    deps_path = os.path.join(
+                        scan_dir, f"{DISCOVERY_DEPS_ENV.lower()}.json")
+                    future = pool.submit(
+                        _run_discovery_scan,
+                        scan_step,
+                        cwd_text,
+                        deps_path,
+                        frozenset(names),
+                    )
+                    active[future] = ("scan", name)
+                    scans_started.add(name)
+                    free_slots -= 1
+                    continue
+
+                if name in builds_started:
+                    continue
+                if scan_step is not None and name not in manifests:
+                    # Its scan is active, failed into outcomes, or about to be
+                    # started; never build before the manifest is final.
+                    continue
+
+                deps = direct_dependencies(name)
+                if not all(dep in outcomes for dep in deps):
+                    continue
+                if any(outcomes[dep].status != "ok" for dep in deps):
+                    # Final cycle/skip propagation assigns the precise terminal
+                    # state once global discovery has settled.
+                    continue
+
+                builds_started.add(name)
+                future = pool.submit(
+                    _launch_discovered_build,
+                    validated_plan[name],
+                    cwd_text,
+                )
+                active[future] = ("build", name)
+                free_slots -= 1
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            while True:
+                classify_final_cycles_and_skips()
+                launch_available(pool)
+
+                if not active:
+                    unfinished = [
+                        name for name in selected if name not in outcomes]
+                    if unfinished:
+                        raise RuntimeError(
+                            "execute_discovered scheduler stalled; unfinished "
+                            "steps: " + ", ".join(unfinished))
+                    break
+
+                completed, _not_completed = wait(
+                    set(active), return_when=FIRST_COMPLETED)
+                for future in completed:
+                    kind, name = active.pop(future)
+                    result = future.result()
+
+                    if kind == "scan":
+                        scan_outcome, dependencies = result
+                        if dependencies is None:
+                            outcomes[name] = scan_outcome
+                            continue
+
+                        # The manifest was wholly validated before adoption.
+                        manifests[name] = dependencies
+                        select_static_closure(dependencies)
+                    else:
+                        outcomes[name] = result
+
+        return {
+            name: outcomes[name]
+            for name in names
+            if name in selected
+        }
+    finally:
+        shutil.rmtree(scan_root, ignore_errors=True)
 
 
 def _valid_check_id(check_id):
