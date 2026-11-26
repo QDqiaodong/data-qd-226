@@ -448,7 +448,101 @@ outcomes = execute_with_artifacts(
 ### 终态
 
 `ok`、`failed`、`timeout`、`launch_error`、`artifact_error`、`skipped`。
-失败只阻断依赖它的分支；`Outcome` 的字段与基础入口一致。
+失败只阻断依赖它的分支；`Outcome` 的字段与前面入口一致。
+
+## `execute_release`：双配方、ABI 探针与原子交付
+
+```python
+from executor import ReleaseCohort, Step, execute_release
+
+cohort = ReleaseCohort(
+    primary={                          # 首选配方：名称 -> Step
+        "compile": Step((...), after=("prep",)),
+        "abi_probe": Step((... "probe.py", "primary"), after=("compile",)),
+        "package": Step((... "pack.py"), after=("compile",)),
+    },
+    fallback={                         # 备用配方：步骤/依赖可以完全不同
+        "compile": Step((...), after=("prep", "fb_prep")),
+        "abi_probe": Step((... "probe.py", "fallback"), after=("compile",)),
+        "package": Step((... "pack.py"), after=("compile",)),
+    },
+    probe="abi_probe",                 # 两套配方都存在的探针步骤名
+    package="package",                 # 两套配方都存在的打包步骤名
+)
+
+results = execute_release(
+    shared={                           # 不受配方影响的公共步骤
+        "prep": Step((... "resource_table.py")),
+        "fb_prep": Step((... "alt_resource_table.py")),
+    },
+    cohorts={"linux-x86_64": cohort},  # 组名 -> ReleaseCohort，1..8 组
+    release_dir=release_dir,           # 已存在的目录；正式包写到其下
+    workers=2,                         # 1..8 的整数，布尔值不算整数
+)
+result = results["linux-x86_64"]
+result.status                # published / incompatible / failed
+result.published_profile     # "primary" / "fallback" / None
+result.probes                # 已启用配方名 -> 探针 Outcome（未启用为 skipped）
+result.detail                # 未发布时的定位原因；成功发布时为 ""
+```
+
+返回按 `cohorts` 输入顺序排列的普通 dict，值是冻结的 `ReleaseResult`。
+本入口是库接口，不新增 CLI，也没有第三方依赖。
+
+### 配方选择与探针语义
+
+- 每组先跑 `primary`。探针零退出表示当前配方通过；退出码 **42** 表示 ABI
+  不兼容，组内已启动的首选命令全部收尾并回收名额后，才切换到 `fallback`，
+  在独立的空工作目录里重跑备用配方自己依赖的组内步骤（即使名字或 argv 与
+  首选相同也是新的执行身份），可复用的只有本次已成功的公共步骤。
+- 探针的其他非零退出、启动失败、超时，或前置步骤失败都是**构建错误**，不
+  触发换配方；打包失败同样不换配方。备用探针也判 42 时返回 `incompatible`，
+  不再尝试。若打包先于探针结束，仍以探针结论为准：不兼容结论不会被先结束
+  的打包结果覆盖。
+- 公共步骤只在已选配方（含间接依赖）确实需要时才选中，本次调用内至多执行
+  一次；公共步骤失败只阻断依赖它的组和步骤。备用步骤不会继承同名首选步骤
+  的失败或产物。
+
+### 工作目录与环境
+
+- 每次调用在系统临时目录下新建一个独占根目录：其中 `shared/` 是公共工作
+  目录，每组每套启用配方各有一个独立的空工作目录（`<根>/<组名>/primary`、
+  `<根>/<组名>/fallback`）。
+- 公共命令以公共目录为 cwd；组内命令以对应配方目录为 cwd，并通过环境变量
+  `BUILD_RELEASE_SHARED_DIR` 拿到公共目录的绝对路径。配方命令不应写公共
+  目录；构建子进程不直接写正式发布路径。
+- 命令沿用 `Step` 的 argv、超时、不经 shell、stdin 为 `DEVNULL`、继承环境
+  的语义。调用返回（成功或失败）后收走本轮临时目录，不动发布目录中的其他
+  文件。同一 `release_dir` 同时只允许一个发布构建（目录内 `flock` 锁），
+  但其他进程可以随时读取其中的正式包。
+
+### 打包合规与原子发布
+
+- 打包命令把**单个文件**写到自己 cwd 下的 `bundle`，不超过 512 MiB。允许
+  在探针结论前做候选打包，也允许等探针批准后再打包；候选包只存在于临时
+  工作目录，发布路径上不会出现候选字节。
+- 只有**同一配方**的探针零退出、打包零退出，且该配方的 `bundle` 是合规、
+  可读的普通文件（不是符号链接）时，才发布到
+  `release_dir/<组名>.bundle`。符号链接、非常规文件、不可读或超限都判失败。
+- 正式路径的切换是单次 `os.replace`：已打开的旧句柄仍能读完旧字节，新打开
+  者只能看到完整的旧包或完整的新包。首次发布前正式包不存在；探针拒绝、打包
+  失败、`bundle` 不合规或发布操作失败时，已有正式包保持原样，原来没有就
+  继续没有。暂存文件与临时目录在返回前清理。
+
+### 校验、限制与调度
+
+- 组名是 1..32 个 ASCII 字母、数字、`-` 或 `_`；步骤名是非空、无 NUL、
+  UTF-8 编码至多 128 字节的字符串。1..8 个组；公共步骤加两套配方合计至多
+  256 步；每步至多 256 项 `after`。
+- 公共步骤只能依赖公共步骤；组内步骤只能依赖本组当前配方的步骤或公共
+  步骤，且不能与公共步骤同名。探针和打包步骤都没有下游；每个普通组内步骤
+  必须是探针或打包至少其一的前置。两套配方（包括不会启用的备用配方）的
+  类型、引用和依赖环都在启动任何命令前校验，无效时抛 `ValueError`，不启动
+  命令、不改发布目录。
+- 公共步骤、探针、实际构建和打包命令共用 `workers` 个名额；等待依赖或探针
+  结论不占名额。必需工作按组轮询分配名额，任何组都不能独占整组额度；候选
+  打包只能占用没有必需工作可用的空闲名额，不会抢占已启动的命令。一个组的
+  探测或换配方不会阻塞其他组已经就绪的工作与发布。
 
 ## 运行测试与演示
 
@@ -485,11 +579,21 @@ python3 -m unittest -v test_incremental_concurrent
 构建共用并发上限，以及扫描错误分类和临时清单目录清理。所有握手均使用有界等
 待，不靠固定睡眠猜测辅助进程启动顺序。
 
+`test_release.py` 同样只用标准库、真实子进程和有界文件握手，覆盖：首选探针
+批准时只发布首选字节且备用步骤不启动、退出 42 时整组切换到备用配方并发布备用
+字节（公共准备只跑一次、备用专用公共步骤按需启动、两套同名编译步骤使用各自
+空工作目录）、普通探针错误不换配方、两次 42 返回 `incompatible`、前置失败不
+换配方且探针记为 `skipped`、备用打包留下半成品或符号链接/超限 `bundle` 时不
+覆盖旧包、坏声明（含未启用备用配方中的坏边）在启动前拒绝、两个组在两个名额下
+并行而不互相独占额度、慢组探针与快组发布之间的握手、切换前打开的旧句柄读完旧
+字节而新句柄只见完整新包，以及同目录并发发布被锁拒绝和无关发布文件保留。
+
 所有入口都仅运行调用者信任的 argv，无 shell、无沙箱，继承调用进程环境和
 设定的 cwd，并把步骤 stdin 设为 `/dev/null`。基础 `execute` 的超时由
 subprocess 管理直接子进程、不跟踪后代；`execute_discovered` 的扫描和构建采
 用同样的直接子进程边界，不做进程组监督或跨次状态。`execute_guarded` 则使用
 独立进程组并在拒绝/超时时 kill 整个步骤组。`execute_with_artifacts` 另有暂
-存额度和清理契约。除 `execute_incremental` 按上文持久化内容指纹和有效输出记
-录外，其他入口不持久化任务；所有入口均不自动重试，没有依赖约束的步骤不保证
-完成顺序。
+存额度和清理契约；`execute_release` 用独立工作目录、`BUILD_RELEASE_SHARED_DIR`
+环境变量和单次 `os.replace` 原子切换保证候选字节不出现在正式发布路径。除
+`execute_incremental` 按上文持久化内容指纹和有效输出记录外，其他入口不持久
+化任务；所有入口均不自动重试，没有依赖约束的步骤不保证完成顺序。

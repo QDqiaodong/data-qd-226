@@ -2271,3 +2271,782 @@ def execute_incremental(
     return IncrementalResult(
         outcomes=ordered_outcomes,
         source_bytes_read=source_cache.bytes_read)
+
+
+# ---------------------------------------------------------------------------
+# execute_release: two-recipe cohorts with an ABI probe and atomic delivery.
+# ---------------------------------------------------------------------------
+
+MAX_RELEASE_COHORTS = 8
+MAX_RELEASE_STEPS = 256
+MAX_RELEASE_WORKERS = 8
+MAX_RELEASE_AFTER_ITEMS = 256
+MAX_RELEASE_COHORT_NAME_BYTES = 32
+MAX_RELEASE_NAME_BYTES = 128
+MAX_BUNDLE_BYTES = 512 * 1024 * 1024
+RELEASE_SHARED_DIR_ENV = "BUILD_RELEASE_SHARED_DIR"
+RELEASE_INCOMPATIBLE_RETURNCODE = 42
+RELEASE_SCRATCH_PREFIX = "executor-release-"
+RELEASE_LOCK_NAME = ".executor-release.lock"
+RELEASE_STAGE_PREFIX = ".bundle-stage-"
+
+
+@dataclass(frozen=True)
+class ReleaseCohort:
+    """The two recipes for one platform plus its probe/package step names.
+
+    ``primary`` and ``fallback`` are name -> Step mappings that may contain
+    different ordinary steps and dependencies.  ``probe`` and ``package`` must
+    name two distinct steps present in both mappings.
+    """
+
+    primary: dict
+    fallback: dict
+    probe: str
+    package: str
+
+
+@dataclass(frozen=True)
+class ReleaseResult:
+    """Final verdict for one cohort, in the order of the input mapping."""
+
+    status: str
+    published_profile: Optional[str]
+    probes: dict
+    detail: str
+
+
+def _valid_release_name(name):
+    if not isinstance(name, str) or not name or "\x00" in name:
+        return False
+    try:
+        return len(name.encode("utf-8")) <= MAX_RELEASE_NAME_BYTES
+    except UnicodeEncodeError:
+        return False
+
+
+def _valid_release_cohort_name(name):
+    if not isinstance(name, str) or not name:
+        return False
+    try:
+        encoded = name.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    if not 1 <= len(encoded) <= MAX_RELEASE_COHORT_NAME_BYTES:
+        return False
+    return all(
+        "a" <= ch <= "z" or "A" <= ch <= "Z" or "0" <= ch <= "9"
+        or ch in "-_"
+        for ch in name)
+
+
+def _materialize_mapping(mapping, label):
+    if not isinstance(mapping, Mapping):
+        raise ValueError(f"{label} must be a name to Step mapping")
+    try:
+        return dict(mapping)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a name to Step mapping") from exc
+
+
+def _validate_release_recipe(recipe, probe, package, shared_names, label):
+    """Validate one recipe of one cohort, including its full graph."""
+    if len(recipe) < 2:
+        raise ValueError(f"{label}: a recipe must contain at least probe and package")
+    if not _valid_release_name(probe):
+        raise ValueError(f"{label}: probe step name must be a valid step name")
+    if not _valid_release_name(package):
+        raise ValueError(f"{label}: package step name must be a valid step name")
+    if probe == package:
+        raise ValueError(f"{label}: probe and package must be distinct steps")
+    if probe not in recipe:
+        raise ValueError(f"{label}: probe step {probe!r} is not in the recipe")
+    if package not in recipe:
+        raise ValueError(f"{label}: package step {package!r} is not in the recipe")
+
+    for name, step in recipe.items():
+        if not _valid_release_name(name):
+            raise ValueError(
+                f"{label}: step name {name!r} must be a nonempty NUL-free "
+                f"string of at most {MAX_RELEASE_NAME_BYTES} UTF-8 bytes")
+        if not isinstance(step, Step):
+            raise ValueError(f"{label}[{name!r}] must be a Step")
+        if (not isinstance(step.argv, tuple) or not step.argv
+                or not all(isinstance(arg, str) and "\x00" not in arg
+                           for arg in step.argv)
+                or not step.argv[0]):
+            raise ValueError(f"{label}[{name!r}]: invalid argv")
+        if not _timeout_is_finite_positive(step.timeout):
+            raise ValueError(
+                f"{label}[{name!r}]: timeout must be finite and positive")
+        if not isinstance(step.after, tuple):
+            raise ValueError(f"{label}[{name!r}]: after must be a tuple")
+        if len(step.after) > MAX_RELEASE_AFTER_ITEMS:
+            raise ValueError(
+                f"{label}[{name!r}]: at most {MAX_RELEASE_AFTER_ITEMS} "
+                "after entries")
+        for dep in step.after:
+            if not isinstance(dep, str):
+                raise ValueError(f"{label}[{name!r}]: non-string dependency")
+            if dep not in recipe and dep not in shared_names:
+                raise ValueError(
+                    f"{label}[{name!r}]: unknown dependency {dep!r}")
+        if name in shared_names:
+            raise ValueError(
+                f"{label}[{name!r}]: cohort steps must not share a name with "
+                "a shared step")
+
+    # Probe and package are the terminal vertices: nothing may depend on them.
+    for name, step in recipe.items():
+        if probe in step.after:
+            raise ValueError(f"{label}: probe {probe!r} must have no downstream")
+        if package in step.after:
+            raise ValueError(
+                f"{label}: package {package!r} must have no downstream")
+
+    # Every ordinary step must be an ancestor of the probe or the package.
+    dependents = {name: [] for name in recipe}
+    for name, step in recipe.items():
+        for dep in step.after:
+            if dep in recipe:
+                dependents[dep].append(name)
+
+    def reaches_terminal(start):
+        seen = set()
+        stack = [start]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if current == probe or current == package:
+                return True
+            stack.extend(dependents[current])
+        return False
+
+    for name in recipe:
+        if name in (probe, package):
+            continue
+        if not reaches_terminal(name):
+            raise ValueError(
+                f"{label}: ordinary step {name!r} is not a prerequisite of "
+                "the probe or the package")
+
+    # Validate the recipe graph including shared edges.  Shared steps are
+    # represented as source vertices, so cycles within the recipe surface here.
+    graph = {
+        name: tuple(dep for dep in step.after if dep in recipe)
+        for name, step in recipe.items()
+    }
+    try:
+        TopologicalSorter(graph).prepare()
+    except CycleError as exc:
+        raise ValueError(
+            f"{label}: dependency cycle: {exc.args[1]}") from exc
+
+
+def _validate_release_call(shared, cohorts, release_dir, workers):
+    if type(workers) is not int or not 1 <= workers <= MAX_RELEASE_WORKERS:
+        raise ValueError(
+            f"workers must be an integer in [1, {MAX_RELEASE_WORKERS}] and "
+            "must not be a bool")
+
+    if not isinstance(cohorts, Mapping) or not cohorts:
+        raise ValueError("cohorts must be a nonempty name to ReleaseCohort mapping")
+    cohort_items = list(cohorts.items())
+    if len(cohort_items) > MAX_RELEASE_COHORTS:
+        raise ValueError(f"at most {MAX_RELEASE_COHORTS} cohorts per call")
+    cohort_names = []
+    for cohort_name, cohort in cohort_items:
+        if not _valid_release_cohort_name(cohort_name):
+            raise ValueError(
+                f"cohort name {cohort_name!r} must be 1.."
+                f"{MAX_RELEASE_COHORT_NAME_BYTES} ASCII letters, digits, "
+                "'-' or '_'")
+        if not isinstance(cohort, ReleaseCohort):
+            raise ValueError(
+                f"cohorts[{cohort_name!r}] must be a ReleaseCohort")
+        cohort_names.append(cohort_name)
+
+    shared_plan = _materialize_mapping(shared, "shared")
+    shared_names = set(shared_plan)
+    for name, step in shared_plan.items():
+        if not _valid_release_name(name):
+            raise ValueError(
+                f"shared step name {name!r} must be a nonempty NUL-free "
+                f"string of at most {MAX_RELEASE_NAME_BYTES} UTF-8 bytes")
+        if not isinstance(step, Step):
+            raise ValueError(f"shared[{name!r}] must be a Step")
+        if (not isinstance(step.argv, tuple) or not step.argv
+                or not all(isinstance(arg, str) and "\x00" not in arg
+                           for arg in step.argv)
+                or not step.argv[0]):
+            raise ValueError(f"shared[{name!r}]: invalid argv")
+        if not _timeout_is_finite_positive(step.timeout):
+            raise ValueError(
+                f"shared[{name!r}]: timeout must be finite and positive")
+        if not isinstance(step.after, tuple):
+            raise ValueError(f"shared[{name!r}]: after must be a tuple")
+        if len(step.after) > MAX_RELEASE_AFTER_ITEMS:
+            raise ValueError(
+                f"shared[{name!r}]: at most {MAX_RELEASE_AFTER_ITEMS} "
+                "after entries")
+        for dep in step.after:
+            if not isinstance(dep, str) or dep not in shared_plan:
+                raise ValueError(
+                    f"shared[{name!r}]: shared steps may only depend on "
+                    f"shared steps; bad dependency {dep!r}")
+
+    try:
+        TopologicalSorter(
+            {name: shared_plan[name].after for name in shared_plan}).prepare()
+    except CycleError as exc:
+        raise ValueError(
+            f"shared dependency cycle: {exc.args[1]}") from exc
+
+    total_steps = len(shared_plan)
+    validated_cohorts = []
+    for cohort_name, cohort in cohort_items:
+        primary = _materialize_mapping(cohort.primary, f"cohort {cohort_name!r} primary")
+        fallback = _materialize_mapping(cohort.fallback, f"cohort {cohort_name!r} fallback")
+        primary_label = f"cohort {cohort_name!r} primary"
+        fallback_label = f"cohort {cohort_name!r} fallback"
+        _validate_release_recipe(
+            primary, cohort.probe, cohort.package, shared_names, primary_label)
+        _validate_release_recipe(
+            fallback, cohort.probe, cohort.package, shared_names, fallback_label)
+        total_steps += len(primary) + len(fallback)
+        validated_cohorts.append((cohort_name, cohort, primary, fallback))
+
+    if total_steps > MAX_RELEASE_STEPS:
+        raise ValueError(
+            f"shared steps plus both recipes must total at most "
+            f"{MAX_RELEASE_STEPS} steps (declared {total_steps})")
+
+    release_path = _path_argument(release_dir, "release_dir")
+    if not os.path.isdir(release_path):
+        raise ValueError("release_dir must be an existing directory")
+
+    return shared_plan, validated_cohorts, os.path.abspath(release_path)
+
+
+def _release_identity_label(identity):
+    """Human-readable step name for a blocked_by tuple."""
+    if identity[0] == "shared":
+        return identity[1]
+    return identity[2]
+
+
+def _run_release_step(step, cwd, shared_dir):
+    """Run one release command with the shared directory in its environment."""
+    env = os.environ.copy()
+    env[RELEASE_SHARED_DIR_ENV] = shared_dir
+    return _launch_env(step, cwd, env)
+
+
+def _verify_release_bundle(bundle_path):
+    """Return None when bundle is a readable regular file within the limit."""
+    try:
+        info = os.lstat(bundle_path)
+    except OSError as exc:
+        return f"bundle stat error: {exc}"
+    if stat_mod.S_ISLNK(info.st_mode):
+        return "bundle is a symbolic link, not a regular file"
+    if not stat_mod.S_ISREG(info.st_mode):
+        return "bundle is not a regular file"
+    if info.st_size > MAX_BUNDLE_BYTES:
+        return (f"bundle is {info.st_size} bytes; limit is "
+                f"{MAX_BUNDLE_BYTES} bytes")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(bundle_path, flags)
+        try:
+            while True:
+                chunk = os.read(fd, READ_CHUNK)
+                if not chunk:
+                    break
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        return f"bundle unreadable: {exc}"
+    return None
+
+
+def _stage_and_publish(bundle_path, destination, release_dir):
+    """Atomically replace destination with bundle_path's bytes.
+
+    Returns None on success, otherwise an error detail.  All staging happens
+    on the destination filesystem so the final switch is one os.replace call.
+    """
+    fd, stage_path = tempfile.mkstemp(
+        prefix=RELEASE_STAGE_PREFIX, dir=release_dir)
+    os.close(fd)
+    try:
+        os.unlink(stage_path)
+        try:
+            # Same filesystem: hard links give an exact, copy-free staging copy.
+            os.link(bundle_path, stage_path)
+        except OSError:
+            # Cross-device or hard links unsupported: stream a private copy.
+            flags_in = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags_in |= os.O_NOFOLLOW
+            src = os.open(bundle_path, flags_in)
+            try:
+                dst = os.open(
+                    stage_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600)
+                try:
+                    while True:
+                        chunk = os.read(src, READ_CHUNK)
+                        if not chunk:
+                            break
+                        view = memoryview(chunk)
+                        while view:
+                            written = os.write(dst, view)
+                            view = view[written:]
+                finally:
+                    os.close(dst)
+            finally:
+                os.close(src)
+        try:
+            mode = stat_mod.S_IMODE(os.stat(bundle_path).st_mode)
+            os.chmod(stage_path, mode)
+        except OSError:
+            pass
+        os.replace(stage_path, destination)
+        return None
+    except OSError as exc:
+        return f"publish failed: {exc}"
+    finally:
+        # On success the staged path no longer exists; on any failure make sure
+        # no partial staging file is left next to the formal bundles.
+        try:
+            if os.path.lexists(stage_path):
+                os.unlink(stage_path)
+        except OSError:
+            pass
+
+
+def execute_release(shared, cohorts, *, release_dir, workers=2):
+    """Build every cohort with primary/fallback recipes and an ABI probe.
+
+    Each cohort starts on its primary recipe.  A probe exiting 42 means the
+    recipe is ABI-incompatible and the cohort switches, once, to its fallback
+    recipe after every already-started primary command has finished.  Any
+    other probe failure, build failure, timeout, launch error or failed
+    prerequisite is a build error and never triggers the other recipe.  A
+    bundle is published to ``release_dir/<cohort>.bundle`` only when the same
+    recipe's probe approved (exit 0), its package exited 0, and its bundle is
+    a compliant readable regular file; the switch is atomic and an existing
+    bundle is left untouched on any failure.
+    """
+    shared_plan, validated_cohorts, release_path = _validate_release_call(
+        shared, cohorts, release_dir, workers)
+
+    lock_fd = None
+    scratch_root = None
+    try:
+        if fcntl is not None:
+            lock_path = os.path.join(release_path, RELEASE_LOCK_NAME)
+            try:
+                lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    os.close(lock_fd)
+                    lock_fd = None
+                    raise ValueError(
+                        "another release build is already running against "
+                        f"{release_path}") from exc
+            except OSError as exc:
+                if isinstance(exc, ValueError):
+                    raise
+                raise ValueError(
+                    f"cannot acquire release lock {lock_path}: {exc}") from exc
+
+        # Only create scratch space once the call is fully committed, so a
+        # rejected concurrent run leaves no temp directory behind.
+        scratch_root = tempfile.mkdtemp(prefix=RELEASE_SCRATCH_PREFIX)
+        shared_dir = os.path.join(scratch_root, "shared")
+        os.mkdir(shared_dir)
+
+        cohort_names = [item[0] for item in validated_cohorts]
+
+        # Node bookkeeping.  Identity tuple kinds:
+        #   ("shared", name)
+        #   (cohort_name, profile, name)
+        node_step = {}
+        node_cwd = {}
+        node_deps = {}
+        node_state = {}
+        node_outcome = {}
+        selected_shared = set()
+        cohort_state = {}
+        cohort_recipes = {}
+        primary_nodes_by_cohort = {}
+
+        for name, step in shared_plan.items():
+            identity = ("shared", name)
+            node_step[identity] = step
+            node_cwd[identity] = shared_dir
+            node_deps[identity] = [
+                ("shared", dep) for dep in step.after]
+            node_state[identity] = "pending"
+
+        def shared_ancestors(names, recipe):
+            # Collect every shared step reachable through after-edges, starting
+            # from the recipe's direct shared dependencies and then following
+            # the shared graph itself (including shared-only chains).
+            result = set()
+            stack = []
+            for step_name in names:
+                for dep in recipe[step_name].after:
+                    if dep in shared_plan:
+                        stack.append(dep)
+            while stack:
+                current = stack.pop()
+                if current in result:
+                    continue
+                result.add(current)
+                stack.extend(
+                    dep for dep in shared_plan[current].after
+                    if dep in shared_plan)
+            return result
+
+        for cohort_name, cohort, primary, fallback in validated_cohorts:
+            cohort_dir = os.path.join(scratch_root, cohort_name)
+            os.mkdir(cohort_dir)
+            cohort_recipes[cohort_name] = (cohort, primary, fallback)
+            primary_nodes_by_cohort[cohort_name] = set()
+
+            for profile, recipe in (("primary", primary),
+                                    ("fallback", fallback)):
+                profile_dir = os.path.join(cohort_dir, profile)
+                os.mkdir(profile_dir)
+                for step_name, step in recipe.items():
+                    identity = (cohort_name, profile, step_name)
+                    node_step[identity] = step
+                    node_cwd[identity] = profile_dir
+                    node_deps[identity] = []
+                    for dep in step.after:
+                        if dep in shared_plan:
+                            node_deps[identity].append(("shared", dep))
+                        else:
+                            node_deps[identity].append(
+                                (cohort_name, profile, dep))
+                    node_state[identity] = "pending"
+
+            # The primary recipe's shared closure is needed from the start;
+            # additional fallback-only shared steps are selected on switch.
+            selected_shared.update(shared_ancestors(primary.keys(), primary))
+            for step_name in primary:
+                primary_nodes_by_cohort[cohort_name].add(
+                    (cohort_name, "primary", step_name))
+            cohort_state[cohort_name] = {
+                "phase": "primary",            # primary / switching / fallback / done
+                "probe": cohort.probe,
+                "package": cohort.package,
+                "probe_outcomes": {},
+                "publish_attempted": {"primary": False, "fallback": False},
+                "status": None,
+                "profile": None,
+                "detail": "",
+            }
+
+        def failure_detail(state, cohort_name, probe_outcome, profile):
+            if state["detail"]:
+                return state["detail"]
+            package_id = (cohort_name, profile, state["package"])
+            package_outcome = node_outcome.get(package_id)
+            if package_outcome is not None and package_outcome.status != "ok":
+                suffix = f": {package_outcome.detail}" \
+                    if package_outcome.detail else ""
+                return f"{profile} package {package_outcome.status}{suffix}"
+            if probe_outcome is None:
+                return f"{profile} probe did not run"
+            if probe_outcome.status == "skipped":
+                blockers = ", ".join(probe_outcome.blocked_by) \
+                    or "unspecified"
+                return (f"{profile} probe blocked by failed prerequisite(s): "
+                        f"{blockers}")
+            suffix = f": {probe_outcome.detail}" if probe_outcome.detail else ""
+            return f"{profile} probe {probe_outcome.status}{suffix}"
+
+        active = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            while True:
+                made_progress = False
+
+                # 1. State transitions for cohorts.
+                for cohort_name in cohort_names:
+                    state = cohort_state[cohort_name]
+                    if state["status"] is not None:
+                        continue
+                    _, primary, fallback = cohort_recipes[cohort_name]
+
+                    if state["phase"] == "primary":
+                        primary_terminal = all(
+                            node_state[identity] == "terminal"
+                            for identity in primary_nodes_by_cohort[cohort_name])
+                        if primary_terminal:
+                            probe_id = (cohort_name, "primary", state["probe"])
+                            probe_outcome = node_outcome[probe_id]
+                            state["probe_outcomes"]["primary"] = probe_outcome
+                            # Only a probe that actually ran and exited 42 is an
+                            # ABI verdict; skipped/timeout/launch probes are build
+                            # errors that must not activate the fallback recipe.
+                            if probe_outcome.status == "failed" \
+                                    and probe_outcome.returncode == \
+                                    RELEASE_INCOMPATIBLE_RETURNCODE:
+                                state["phase"] = "switching"
+                            else:
+                                state["phase"] = "done"
+
+                    if state["phase"] == "switching":
+                        # Every already-started primary command must have been
+                        # reaped before a fallback command may launch.
+                        primary_running = any(
+                            node_state[identity] == "running"
+                            for identity in primary_nodes_by_cohort[cohort_name])
+                        if not primary_running:
+                            added = shared_ancestors(fallback.keys(), fallback)
+                            selected_shared.update(added)
+                            state["phase"] = "fallback"
+                            made_progress = True
+
+                    if state["phase"] == "fallback":
+                        fallback_terminal = all(
+                            node_state[(cohort_name, "fallback", step_name)]
+                            == "terminal"
+                            for step_name in fallback)
+                        if fallback_terminal:
+                            probe_id = (
+                                cohort_name, "fallback", state["probe"])
+                            state["probe_outcomes"]["fallback"] = \
+                                node_outcome[probe_id]
+                            state["phase"] = "done"
+
+                # 2. Cascade skips for pending nodes whose deps are terminal.
+                for identity, status in list(node_state.items()):
+                    if status != "pending":
+                        continue
+                    kind = identity[0]
+                    if kind == "shared":
+                        if identity[1] not in selected_shared:
+                            continue
+                    else:
+                        owner, profile, _ = identity
+                        if profile == "fallback" and \
+                                cohort_state[owner]["phase"] != "fallback":
+                            # A fallback recipe is only live while its cohort
+                            # is actively running it.  Before a switch it is
+                            # simply dormant; after primary success or a primary
+                            # failure the cohort never enters the fallback
+                            # phase, so these nodes stay pending and are never
+                            # run, skipped, or reported as probes.
+                            continue
+                    deps = node_deps[identity]
+                    if not all(node_state[dep_id] == "terminal"
+                               for dep_id in deps):
+                        continue
+                    blockers = tuple(dict.fromkeys(
+                        _release_identity_label(dep_id) for dep_id in deps
+                        if node_outcome[dep_id].status != "ok"))
+                    if blockers:
+                        node_outcome[identity] = Outcome(
+                            "skipped", blocked_by=blockers)
+                        node_state[identity] = "terminal"
+                        made_progress = True
+
+                # 3. Publish completed, approved packages.
+                for cohort_name in cohort_names:
+                    state = cohort_state[cohort_name]
+                    if state["status"] is not None:
+                        continue
+                    _, primary, fallback = cohort_recipes[cohort_name]
+                    for profile, recipe in (("primary", primary),
+                                            ("fallback", fallback)):
+                        if state["publish_attempted"][profile]:
+                            continue
+                        probe_id = (cohort_name, profile, state["probe"])
+                        package_id = (cohort_name, profile, state["package"])
+                        if node_state.get(probe_id) != "terminal" \
+                                or node_state.get(package_id) != "terminal":
+                            continue
+                        probe_outcome = node_outcome[probe_id]
+                        package_outcome = node_outcome[package_id]
+                        state["probe_outcomes"].setdefault(
+                            profile, probe_outcome)
+                        state["publish_attempted"][profile] = True
+                        if probe_outcome.status != "ok":
+                            continue
+                        if package_outcome.status != "ok":
+                            continue
+                        bundle_path = os.path.join(
+                            node_cwd[package_id], "bundle")
+                        detail = _verify_release_bundle(bundle_path)
+                        if detail is not None:
+                            state["detail"] = detail
+                            continue
+                        destination = os.path.join(
+                            release_path, f"{cohort_name}.bundle")
+                        detail = _stage_and_publish(
+                            bundle_path, destination, release_path)
+                        if detail is not None:
+                            state["detail"] = detail
+                            continue
+                        state["status"] = "published"
+                        state["profile"] = profile
+                        state["detail"] = ""
+                        made_progress = True
+
+                # 4. Finalize cohorts whose enabled profile(s) are terminal.
+                for cohort_name in cohort_names:
+                    state = cohort_state[cohort_name]
+                    if state["status"] is not None:
+                        continue
+                    if state["phase"] != "done":
+                        continue
+                    _, primary, fallback = cohort_recipes[cohort_name]
+                    primary_probe = state["probe_outcomes"].get("primary")
+                    fallback_probe = state["probe_outcomes"].get("fallback")
+
+                    if primary_probe is not None and \
+                            primary_probe.status == "failed" and \
+                            primary_probe.returncode == \
+                            RELEASE_INCOMPATIBLE_RETURNCODE:
+                        if fallback_probe is None:
+                            continue
+                        if fallback_probe.status == "failed" and \
+                                fallback_probe.returncode == \
+                                RELEASE_INCOMPATIBLE_RETURNCODE:
+                            state["status"] = "incompatible"
+                            state["detail"] = (
+                                "primary and fallback probes both reported "
+                                "ABI incompatibility (exit 42)")
+                        else:
+                            state["status"] = "failed"
+                            state["detail"] = failure_detail(
+                                state, cohort_name,
+                                fallback_probe, "fallback")
+                        made_progress = True
+                        continue
+
+                    state["status"] = "failed"
+                    state["detail"] = failure_detail(
+                        state, cohort_name, primary_probe, "primary")
+                    made_progress = True
+
+                # 5. Launch ready, required work; candidate packages last.
+                # Required work is handed out round-robin across cohorts so no
+                # cohort can hoard the shared process slots; shared steps are
+                # common prerequisites and go first.  Candidate packages only
+                # take slots that no required work can use.
+                free_slots = workers - len(active)
+                if free_slots > 0:
+                    def is_launchable(identity):
+                        if node_state[identity] != "pending":
+                            return False
+                        kind = identity[0]
+                        if kind == "shared":
+                            if identity[1] not in selected_shared:
+                                return False
+                        else:
+                            owner, profile, _ = identity
+                            owner_state = cohort_state[owner]
+                            # Fallback commands may launch only while the
+                            # cohort is actively running its fallback recipe.
+                            if profile == "fallback" and \
+                                    owner_state["phase"] != "fallback":
+                                return False
+                        return all(
+                            node_state[dep_id] == "terminal"
+                            and node_outcome[dep_id].status == "ok"
+                            for dep_id in node_deps[identity])
+
+                    shared_required = []
+                    per_cohort_required = {name: [] for name in cohort_names}
+                    candidate_packages = []
+                    # Snapshot: launching below mutates node_state, which must
+                    # not happen while iterating the live dictionary.
+                    for identity, status in list(node_state.items()):
+                        if status != "pending" or not is_launchable(identity):
+                            continue
+                        if identity[0] == "shared":
+                            shared_required.append(identity)
+                        elif identity[2] == cohort_state[identity[0]]["package"]:
+                            candidate_packages.append(identity)
+                        else:
+                            per_cohort_required[identity[0]].append(identity)
+                    # Common shared prerequisites go first, then required work
+                    # is interleaved round-robin across cohorts so no cohort
+                    # can hoard the shared process slots.
+                    launch_order = list(shared_required)
+                    cohort_queues = [
+                        per_cohort_required[name] for name in cohort_names]
+                    while any(cohort_queues):
+                        for queue in cohort_queues:
+                            if queue:
+                                launch_order.append(queue.pop(0))
+                    # Candidate packages only take slots no required work can.
+                    launch_order.extend(candidate_packages)
+
+                    for identity in launch_order:
+                        if free_slots <= 0:
+                            break
+                        if node_state[identity] != "pending":
+                            continue
+                        node_state[identity] = "running"
+                        future = pool.submit(
+                            _run_release_step,
+                            node_step[identity],
+                            node_cwd[identity],
+                            shared_dir)
+                        active[future] = identity
+                        free_slots -= 1
+                        made_progress = True
+
+                if not active:
+                    if all(cohort_state[name]["status"] is not None
+                           for name in cohort_names):
+                        break
+                    if not made_progress:
+                        unfinished = [
+                            str(identity)
+                            for identity, status in node_state.items()
+                            if status != "terminal"]
+                        raise RuntimeError(
+                            "execute_release scheduler stalled; unfinished "
+                            "nodes: " + ", ".join(unfinished))
+                    continue
+
+                completed, _not_completed = wait(
+                    set(active), return_when=FIRST_COMPLETED)
+                for future in completed:
+                    identity = active.pop(future)
+                    node_outcome[identity] = future.result()
+                    node_state[identity] = "terminal"
+
+        results = {}
+        for cohort_name in cohort_names:
+            state = cohort_state[cohort_name]
+            probes = dict(state["probe_outcomes"])
+            results[cohort_name] = ReleaseResult(
+                status=state["status"],
+                published_profile=state["profile"],
+                probes=probes,
+                detail=state["detail"])
+        return results
+    finally:
+        if lock_fd is not None and fcntl is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
+        if scratch_root is not None:
+            shutil.rmtree(scratch_root, ignore_errors=True)
